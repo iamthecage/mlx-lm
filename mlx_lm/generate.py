@@ -678,12 +678,235 @@ def speculative_generate_step(
             c.stop_speculation()
 
 
+def mtp_speculative_generate_step(
+    prompt: mx.array,
+    model: nn.Module,
+    *,
+    max_tokens: int = 256,
+    num_draft_tokens: int = 4,
+    sampler: Optional[Callable[[mx.array], mx.array]] = None,
+    logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
+    prompt_cache: Optional[Any] = None,
+    prefill_step_size: int = 512,
+    kv_bits: Optional[int] = None,
+    kv_group_size: int = 64,
+    quantized_kv_start: int = 0,
+) -> Generator[Tuple[mx.array, mx.array, bool], None, None]:
+    """Speculative decoding using the model's own in-checkpoint MTP head.
+
+    Draft-free self-speculation: no external draft model. Each round chains the
+    MTP head to propose ``num_draft_tokens`` draft tokens, verifies them all in
+    one backbone forward, and emits the longest accepted prefix plus one
+    always-accepted backbone token. The accept rule is exact token match
+    (identical to :func:`speculative_generate_step`), so the output is
+    token-for-token the same as non-speculative greedy decoding.
+
+    The model must expose ``mtp_step(hidden, tokens, mtp_cache)``,
+    ``make_mtp_cache()``, ``logits(hidden)`` and a trunk ``model`` that returns
+    hidden states. Hybrid (recurrent) trunk caches are rolled back exactly via
+    the ``record_rollback`` protocol (see ``ArraysCache``).
+
+    Yields:
+        Tuple[mx.array, mx.array, bool]: (token, log-probabilities, from_draft).
+    """
+    # The MTP head + helpers live on the text model, which may be nested under a
+    # VLM wrapper (``model.language_model``).
+    tm = getattr(model, "language_model", model)
+    if getattr(tm, "mtp", None) is None or not hasattr(tm, "mtp_step"):
+        raise ValueError(
+            "mtp_speculative_generate_step requires a model with an MTP head "
+            "(qwen3_5 '-mtp' checkpoint)."
+        )
+
+    y = prompt.astype(mx.uint32)
+    prev_tokens = None
+
+    if prompt_cache is None:
+        model_cache = cache.make_prompt_cache(model)
+        mtp_cache = tm.make_mtp_cache()
+    else:
+        n_main = len(model.layers)
+        model_cache = prompt_cache[:n_main]
+        mtp_cache = prompt_cache[n_main:] or tm.make_mtp_cache()
+
+    def _can_speculate(c):
+        return c.is_trimmable() or (
+            hasattr(c, "record_rollback")
+            and getattr(model, "supports_speculative_rollback", False)
+        )
+
+    if not all(_can_speculate(c) for c in model_cache):
+        types = {type(c).__name__ for c in model_cache if not _can_speculate(c)}
+        raise ValueError(
+            f"MTP speculative decoding requires a trimmable prompt cache "
+            f"(got {types})."
+        )
+
+    sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
+
+    quantize_cache_fn = functools.partial(
+        maybe_quantize_kv_cache,
+        quantized_kv_start=quantized_kv_start,
+        kv_group_size=kv_group_size,
+        kv_bits=kv_bits,
+    )
+
+    def _process_and_sample(tokens, logits):
+        if logits_processors:
+            for processor in logits_processors:
+                logits = processor(tokens, logits)
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        return sampler(logprobs), logprobs
+
+    def _backbone(y_arr, n_predict):
+        """Run the trunk over ``y_arr``; return (tokens, logprobs, hidden).
+
+        tokens/logprobs cover the last ``n_predict`` positions; hidden is the
+        full [1, S, H] trunk hidden (post-final-norm) used to seed the MTP head.
+        """
+        nonlocal prev_tokens
+        with mx.stream(generation_stream):
+            hidden = tm.model(y_arr[None], cache=model_cache)
+            logits = tm.logits(hidden)[:, -n_predict:, :]
+            quantize_cache_fn(model_cache)
+            if logits_processors:
+                out_y, out_lp = [], []
+                yy = y_arr[: -(n_predict - 1)] if n_predict > 1 else y_arr
+                for i in range(n_predict):
+                    prev_tokens = (
+                        mx.concatenate([prev_tokens, yy])
+                        if prev_tokens is not None
+                        else yy
+                    )
+                    ty, lp = _process_and_sample(prev_tokens, logits[:, i, :])
+                    out_y.append(ty)
+                    out_lp.append(lp)
+                    yy = ty
+                return (
+                    mx.concatenate(out_y, axis=0),
+                    mx.concatenate(out_lp, axis=0),
+                    hidden,
+                )
+            ty, lp = _process_and_sample(None, logits.squeeze(0))
+            return ty, lp, hidden
+
+    def _mtp_chain(h_seed, tok_seed, depth):
+        """Chain the MTP head to propose ``depth`` draft tokens.
+
+        Seeds from the trunk hidden + last committed token, then chains on the
+        head's own post-hidden. Appends one (hidden, token) pair per step to
+        ``mtp_cache`` (pair 0 is the committed seed; pair i>0 is based on draft
+        ``i`` and is rolled back if that draft is rejected).
+        """
+        drafts, dlps = [], []
+        h = h_seed
+        t = tok_seed.reshape(1, 1)
+        with mx.stream(generation_stream):
+            for _ in range(depth):
+                d_logits, post = tm.mtp_step(h, t, mtp_cache)
+                quantize_cache_fn(mtp_cache)
+                d_tok, d_lp = _process_and_sample(
+                    prev_tokens, d_logits[:, -1, :].squeeze(0)
+                )
+                mx.async_eval(d_tok)
+                drafts.append(d_tok)
+                dlps.append(d_lp)
+                h = post[:, -1:, :]
+                t = d_tok.reshape(1, 1)
+        return drafts, dlps
+
+    # Prefill the trunk, leaving one token for the bootstrap step. Prime the MTP
+    # head's own cache with (hidden_i, token_{i+1}) pairs so it has prompt
+    # context to attend over when drafting (without this, drafts are poor and
+    # almost nothing is accepted).
+    with mx.stream(generation_stream):
+        while y.size > 1:
+            n = min(prefill_step_size, y.size - 1)
+            hidden = tm.model(y[:n][None], cache=model_cache)
+            quantize_cache_fn(model_cache)
+            tm.mtp_step(hidden, y[1 : n + 1][None], mtp_cache)
+            quantize_cache_fn(mtp_cache)
+            mx.eval([c.state for c in model_cache] + [c.state for c in mtp_cache])
+            y = y[n:]
+            mx.clear_cache()
+
+    # Let rollback-capable (recurrent) trunk caches start recording so rejected
+    # drafts can be trimmed exactly. No-op for plain KV caches.
+    for c in model_cache:
+        c.start_speculation()
+
+    depth = max(1, int(num_draft_tokens))
+
+    ntoks = 0
+    try:
+        # Bootstrap: process the last prompt token to emit the first token and
+        # get the trunk hidden that seeds the first draft chain.
+        toks, lps, hidden = _backbone(y, 1)
+        mx.eval(toks)
+        cur_tok = toks[0]
+        cur_lp = lps[0]
+        ntoks += 1
+        yield cur_tok.item(), cur_lp, False
+        h_prev = hidden[:, -1:, :]
+
+        while ntoks < max_tokens:
+            # Draft ``depth`` tokens by chaining the MTP head.
+            drafts, dlps = _mtp_chain(h_prev, cur_tok, depth)
+            # Verify all drafts in one backbone forward over
+            # [cur_tok, d1, ..., d_depth]. n_predict positions give the trunk
+            # prediction after each of those tokens.
+            yv = mx.concatenate(
+                [cur_tok.reshape(1)] + [d.reshape(1) for d in drafts]
+            )
+            toks, lps, hidden = _backbone(yv, depth + 1)
+            mx.eval(toks)
+            tks = [int(t.item()) for t in toks]
+            dfs = [int(d.item()) for d in drafts]
+
+            # Accept the longest matching prefix.
+            n = 0
+            while n < depth and tks[n] == dfs[n]:
+                n += 1
+
+            # Emit accepted drafts, then the backbone's bonus/correction token.
+            stop = False
+            for i in range(n):
+                ntoks += 1
+                yield dfs[i], dlps[i], True
+                if ntoks >= max_tokens:
+                    stop = True
+                    break
+            if stop:
+                break
+            ntoks += 1
+            yield tks[n], lps[n], False
+            if ntoks >= max_tokens:
+                break
+
+            # Roll back rejected drafts: the trunk processed (depth + 1) tokens;
+            # keep cur_tok + the n accepted drafts, trim (depth - n). The MTP
+            # cache appended (depth) pairs; keep pair 0 (committed seed) + the n
+            # accepted-draft pairs, trim (depth - n - 1).
+            cache.trim_prompt_cache(model_cache, depth - n)
+            mtp_trim = max(depth - n - 1, 0)
+            if mtp_trim:
+                cache.trim_prompt_cache(mtp_cache, mtp_trim)
+
+            # Seed the next round from the bonus token and its trunk hidden.
+            cur_tok = toks[n]
+            h_prev = hidden[:, n : n + 1, :]
+    finally:
+        for c in model_cache:
+            c.stop_speculation()
+
+
 def stream_generate(
     model: nn.Module,
     tokenizer: Union[PreTrainedTokenizer, TokenizerWrapper],
     prompt: Union[str, mx.array, List[int]],
     max_tokens: int = 256,
     draft_model: Optional[nn.Module] = None,
+    mtp: bool = False,
     **kwargs,
 ) -> Generator[GenerationResponse, None, None]:
     """
@@ -722,7 +945,13 @@ def stream_generate(
 
     kwargs["max_tokens"] = max_tokens
 
-    if draft_model is None:
+    if mtp and draft_model is None:
+        # Draft-free native MTP self-speculation (uses the model's own MTP head).
+        # num_draft_tokens controls the chain depth.
+        kwargs.pop("max_kv_size", None)
+        kwargs.pop("prompt_progress_callback", None)
+        token_generator = mtp_speculative_generate_step(prompt, model, **kwargs)
+    elif draft_model is None:
         kwargs.pop("num_draft_tokens", None)
         token_generator = generate_step(prompt, model, **kwargs)
         # from_draft always false for non-speculative generation

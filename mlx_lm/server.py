@@ -5,6 +5,7 @@ import json
 import logging
 import pickle
 import platform
+import re
 import socket
 import time
 import uuid
@@ -368,7 +369,9 @@ class ModelProvider:
                 )
 
         # Compute batchability
-        is_batchable = draft_model is None
+        is_batchable = draft_model is None and not getattr(
+            self.cli_args, "mtp_draft", False
+        )
         is_batchable = is_batchable and all(
             hasattr(c, "merge") for c in make_prompt_cache(model)
         )
@@ -973,6 +976,8 @@ class ResponseGenerator:
                     cache += make_prompt_cache(self.model_provider.draft_model)
 
             # Process the prompt and generate tokens
+            gen = None
+            n_draft_accepted = 0
             for gen in stream_generate(
                 model=model,
                 tokenizer=tokenizer,
@@ -982,11 +987,17 @@ class ResponseGenerator:
                 logits_processors=logits_processors,
                 prompt_cache=cache,
                 draft_model=draft_model,
+                mtp=self.cli_args.mtp_draft,
                 num_draft_tokens=args.num_draft_tokens,
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
+                kv_bits=self.cli_args.kv_bits,
+                kv_group_size=self.cli_args.kv_group_size,
+                quantized_kv_start=self.cli_args.quantized_kv_start,
             ):
                 finish_reason = gen.finish_reason
+                if getattr(gen, "from_draft", False):
+                    n_draft_accepted += 1
                 sm_state, match_sequence, current_state = sm.match(sm_state, gen.token)
                 if match_sequence is not None and current_state is None:
                     finish_reason = "stop"
@@ -1012,6 +1023,38 @@ class ResponseGenerator:
 
                 if finish_reason is not None:
                     break
+
+            # Per-request throughput metrics (prefill + decode + peak RAM).
+            if gen is not None:
+                _total_gen = getattr(gen, "generation_tokens", 0) or 0
+                _spec_on = (
+                    self.model_provider.draft_model is not None
+                    or self.cli_args.mtp_draft
+                )
+                if _spec_on and _total_gen > 0:
+                    _acc = 100.0 * n_draft_accepted / _total_gen
+                    # accept length tau = emitted tokens per target forward.
+                    # target forwards = emitted - accepted-draft. tau=1.0 means
+                    # speculation gave no benefit; higher is better.
+                    _forwards = max(_total_gen - n_draft_accepted, 1)
+                    _tau = _total_gen / _forwards
+                    _label = "mtp" if self.cli_args.mtp_draft else "draft"
+                    _draft_str = (
+                        f" | {_label} {n_draft_accepted}/{_total_gen} "
+                        f"accepted ({_acc:.0f}%) accept-len {_tau:.2f}"
+                    )
+                else:
+                    _draft_str = ""
+                logging.info(
+                    "Metrics: prompt %d tok @ %.1f tok/s | gen %d tok @ "
+                    "%.1f tok/s | peak %.2f GB%s",
+                    getattr(gen, "prompt_tokens", 0),
+                    getattr(gen, "prompt_tps", 0.0),
+                    _total_gen,
+                    getattr(gen, "generation_tps", 0.0),
+                    getattr(gen, "peak_memory", 0.0),
+                    _draft_str,
+                )
 
             rqueue.put(None)
 
@@ -1098,6 +1141,77 @@ class APIHandler(BaseHTTPRequestHandler):
         self._set_completion_headers(204)
         self.end_headers()
 
+    def _dump_system_prompt(self):
+        """When --dump-system-prompt is set, append the request's system
+        prompt plus a per-section size breakdown to a file. Useful for seeing
+        exactly what a client (e.g. an agent + its extensions) injects and
+        which block dominates the context budget.
+        """
+        path = getattr(
+            self.response_generator.cli_args, "dump_system_prompt", None
+        )
+        if not path or not isinstance(self.body, dict):
+            return
+        msgs = self.body.get("messages")
+        if not isinstance(msgs, list):
+            return
+        systems = [
+            m for m in msgs if isinstance(m, dict) and m.get("role") == "system"
+        ]
+        if not systems:
+            return
+
+        def _content(m):
+            c = m.get("content")
+            return c if isinstance(c, str) else json.dumps(c)
+
+        text = "\n\n".join(_content(m) for m in systems)
+
+        # Split into blocks on markdown headings, XML-ish tags, or ALL-CAPS
+        # heading lines so each extension's contribution is a labeled section.
+        blocks = []
+        label, buf = "(preamble)", []
+
+        def _flush():
+            if buf:
+                blocks.append((label, len("\n".join(buf))))
+
+        head_re = re.compile(
+            r"^(#{1,6}\s+\S|<[A-Za-z][\w:-]*>|[A-Z][A-Z0-9 _/&-]{3,}:?$)"
+        )
+        for ln in text.split("\n"):
+            if head_re.match(ln.strip()):
+                _flush()
+                label = ln.strip()[:100]
+                buf = [ln]
+            else:
+                buf.append(ln)
+        _flush()
+        blocks.sort(key=lambda b: b[1], reverse=True)
+
+        total = len(text)
+        try:
+            with open(path, "a") as f:
+                f.write("\n" + "=" * 80 + "\n")
+                f.write(
+                    f"{time.strftime('%Y-%m-%d %H:%M:%S')}  "
+                    f"system prompt: {total} chars (~{total // 4} tok), "
+                    f"{len(systems)} system msg(s)\n"
+                )
+                f.write("--- section sizes (largest first) ---\n")
+                for lbl, n in blocks[:50]:
+                    f.write(f"  {n:7d} chars (~{n // 4:6d} tok)  {lbl}\n")
+                f.write("--- full system prompt ---\n")
+                f.write(text + "\n")
+            logging.info(
+                "Dumped system prompt (%d chars, %d sections) to %s",
+                total,
+                len(blocks),
+                path,
+            )
+        except Exception as e:
+            logging.warning("dump-system-prompt failed: %s", e)
+
     def do_POST(self):
         """
         Respond to a POST request from a client.
@@ -1156,6 +1270,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 json.dumps({"error": "Request should be a JSON dictionary"}).encode()
             )
             return
+
+        self._dump_system_prompt()
 
         # Extract request parameters from the body
         self.stream = self.body.get("stream", False)
@@ -1732,6 +1848,42 @@ def _run_http_server(
         response_generator.stop_and_join()
 
 
+def _maybe_install_fused_kv(args):
+    """Install OptiQ's tight-RAM KV-quant patches when KV quantization is on.
+
+    Two idempotent monkeypatches on mlx-lm:
+      * streaming_kv_quant - converts the KV cache one layer at a time so the
+        fp16<->quantized conversion transient stays ~one layer instead of all
+        layers co-resident.
+      * fused_quant_sdpa - FlashAttention-2 tiling of the quantized SDPA so the
+        prefill never materializes the full scores matrix.
+
+    Both fall back to stock mlx-lm for unsupported configs. This is a no-op
+    when optiq is not installed, when --no-fused-kv is passed, or when KV
+    quantization is disabled (no --kv-bits).
+    """
+    if not getattr(args, "fused_kv", False):
+        return
+    if getattr(args, "kv_bits", None) is None:
+        return
+    try:
+        from optiq.runtime import streaming_kv_quant, fused_quant_sdpa
+    except Exception as e:
+        logging.info("fused-kv: optiq not available, using stock mlx-lm (%s)", e)
+        return
+    try:
+        streaming_kv_quant.install()
+        fused_quant_sdpa.install()
+        logging.info(
+            "fused-kv: installed OptiQ streaming KV-quant + fused SDPA "
+            "(kv_bits=%s, group_size=%s)",
+            args.kv_bits,
+            args.kv_group_size,
+        )
+    except Exception as e:
+        logging.warning("fused-kv: install failed, continuing with stock (%s)", e)
+
+
 def run(
     host: str,
     port: int,
@@ -1783,6 +1935,26 @@ def main():
         type=str,
         help="A model to be used for speculative decoding.",
         default=None,
+    )
+    parser.add_argument(
+        "--mtp-draft",
+        action="store_true",
+        help=(
+            "Use the model's own in-checkpoint MTP head for draft-free "
+            "self-speculative decoding (no external --draft-model needed). "
+            "Requires a qwen3_5 '-mtp' checkpoint. Ignored if --draft-model "
+            "is set."
+        ),
+    )
+    parser.add_argument(
+        "--dump-system-prompt",
+        type=str,
+        default=None,
+        help=(
+            "Append each request's system prompt plus a per-section size "
+            "breakdown (largest first) to this file. Useful for seeing what a "
+            "client/agent injects and which block dominates the context."
+        ),
     )
     parser.add_argument(
         "--num-draft-tokens",
@@ -1880,9 +2052,42 @@ def main():
         help="Maximum size in bytes of the KV caches",
     )
     parser.add_argument(
+        "--kv-bits",
+        type=int,
+        default=None,
+        help="Bits for uniform KV-cache quantization (e.g. 8). None disables it.",
+    )
+    parser.add_argument(
+        "--kv-group-size",
+        type=int,
+        default=64,
+        help="Group size for KV-cache quantization (default: 64).",
+    )
+    parser.add_argument(
+        "--quantized-kv-start",
+        type=int,
+        default=0,
+        help=(
+            "Begin quantizing the KV cache only after this many tokens "
+            "(default: 0). Keeps short prompts full-precision."
+        ),
+    )
+    parser.add_argument(
         "--pipeline",
         action="store_true",
         help="Use pipelining instead of tensor parallelism",
+    )
+    parser.add_argument(
+        "--fused-kv",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "When KV-cache quantization is enabled (--kv-bits), install "
+            "OptiQ's streaming KV-quant + fused FlashAttention SDPA patches "
+            "to cut the long-context memory peak. Falls back to stock mlx-lm "
+            "for unsupported configs. Use --no-fused-kv for a bit-exact "
+            "comparison against stock. No-op if optiq is not installed."
+        ),
     )
     args = parser.parse_args()
     if mx.metal.is_available():
@@ -1893,6 +2098,7 @@ def main():
         level=getattr(logging, args.log_level.upper(), None),
         format="%(asctime)s - %(levelname)s - %(message)s",
     )
+    _maybe_install_fused_kv(args)
     run(args.host, args.port, ModelProvider(args))
 
 
