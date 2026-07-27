@@ -18,7 +18,7 @@ The easiest way to get started is to install the `mlx-lm` package:
 **With `pip`**:
 
 ```sh
-pip install mlx-lm -e . --no-build-isolation
+pip install -e . --no-build-isolation
 ```
 
 **With `conda`**:
