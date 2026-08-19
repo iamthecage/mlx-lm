@@ -791,6 +791,11 @@ class ResponseGenerator:
                         "detokenizer": tokenizer.detokenizer,
                         "segment_types": segment_types[::-1],
                         "top_logprobs": args.top_logprobs,
+                        "start_time": time.perf_counter(),
+                        "prompt_tokens": 0,
+                        "prompt_tps": 0.0,
+                        "gen_start_time": None,
+                        "gen_tokens": 0,
                     }
                     # just making sure we don't leave a reference around
                     del cache
@@ -861,6 +866,14 @@ class ResponseGenerator:
                     for r in prompt_responses:
                         result = batch_results[r.uid]
                         result["rqueue"].put(r.progress)
+                        if r.end_of_prompt and result["gen_start_time"] is None:
+                            _now = time.perf_counter()
+                            result["prompt_tokens"] = r.progress[1]
+                            _ptime = _now - result["start_time"]
+                            result["prompt_tps"] = (
+                                r.progress[1] / _ptime if _ptime > 0 else 0.0
+                            )
+                            result["gen_start_time"] = _now
                         if result["ctx"]._should_stop:
                             uids_to_remove.append(r.uid)
 
@@ -885,6 +898,7 @@ class ResponseGenerator:
                     for r in gen_responses:
                         result = batch_results[r.uid]
                         result["detokenizer"].add_token(r.token)
+                        result["gen_tokens"] += 1
                         result["rqueue"].put(
                             Response(
                                 result["detokenizer"].last_segment,
@@ -902,6 +916,26 @@ class ResponseGenerator:
                         )
 
                         if r.finish_reason is not None:
+                            # Per-request throughput metrics (prefill + decode
+                            # + peak RAM). Mirrors the metrics logged by
+                            # _serve_single so the batch (non-MTP) path reports
+                            # the same numbers. No speculation on this path, so
+                            # there is no accept-length segment.
+                            _gen = result["gen_tokens"]
+                            _gstart = result["gen_start_time"]
+                            _gtps = 0.0
+                            if _gstart is not None:
+                                _gtime = time.perf_counter() - _gstart
+                                _gtps = _gen / _gtime if _gtime > 0 else 0.0
+                            logging.info(
+                                "Metrics: prompt %d tok @ %.1f tok/s | gen %d "
+                                "tok @ %.1f tok/s | peak %.2f GB",
+                                result["prompt_tokens"],
+                                result["prompt_tps"],
+                                _gen,
+                                _gtps,
+                                mx.get_peak_memory() / 1e9,
+                            )
                             result["rqueue"].put(None)
                             self.prompt_cache.insert_cache(
                                 current_model_key,
