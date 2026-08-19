@@ -351,7 +351,10 @@ class Qwen3_5TextModel(PipelineMixin, nn.Module):
                 : hidden_states.shape[0]
             ]
 
-        return self.norm(hidden_states)
+        # Keep the decoder output pre-final-norm. The language-model path applies
+        # the final norm below, while the MTP head was trained to consume this
+        # raw backbone representation through its own pre_fc_norm_hidden.
+        return hidden_states
 
 
 class MTPModule(nn.Module):
@@ -392,7 +395,8 @@ class TextModel(nn.Module):
         cache: Optional[Any] = None,
         input_embeddings: Optional[mx.array] = None,
     ) -> mx.array:
-        out = self.model(inputs, cache, input_embeddings=input_embeddings)
+        hidden = self.model(inputs, cache, input_embeddings=input_embeddings)
+        out = self.model.norm(hidden)
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:
@@ -417,9 +421,9 @@ class TextModel(nn.Module):
     def mtp_step(self, hidden, tokens, mtp_cache):
         """One MTP forward over S positions.
 
-        hidden: [B, S, H] post-final-norm hiddens at positions p..p+S-1
-        (from the trunk, or from a previous mtp_step when chaining draft
-        depth). tokens: [B, S] the tokens at positions p+1..p+S (the
+        hidden: [B, S, H] pre-final-norm trunk hiddens at positions p..p+S-1,
+        or the MTP head's own post-normalized hiddens when chaining draft
+        depth. tokens: [B, S] the tokens at positions p+1..p+S (the
         committed or drafted token FOLLOWING each hidden's position).
         Returns (logits [B, S, V], post_norm_hidden [B, S, H]).
 
