@@ -1017,11 +1017,16 @@ class ResponseGenerator:
                 tokenizer=tokenizer,
                 prompt=rest,
                 max_tokens=args.max_tokens,
-                sampler=sampler,
+                sampler=(
+                    None
+                    if self.cli_args.mtp_draft and args.sampling.temperature > 0
+                    else sampler
+                ),
                 logits_processors=logits_processors,
                 prompt_cache=cache,
                 draft_model=draft_model,
                 mtp=self.cli_args.mtp_draft,
+                temp=args.sampling.temperature,
                 num_draft_tokens=args.num_draft_tokens,
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,

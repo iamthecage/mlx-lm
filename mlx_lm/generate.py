@@ -684,6 +684,7 @@ def mtp_speculative_generate_step(
     *,
     max_tokens: int = 256,
     num_draft_tokens: int = 4,
+    temp: float = 0.0,
     sampler: Optional[Callable[[mx.array], mx.array]] = None,
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
     prompt_cache: Optional[Any] = None,
@@ -695,11 +696,18 @@ def mtp_speculative_generate_step(
     """Speculative decoding using the model's own in-checkpoint MTP head.
 
     Draft-free self-speculation: no external draft model. Each round chains the
-    MTP head to propose ``num_draft_tokens`` draft tokens, verifies them all in
-    one backbone forward, and emits the longest accepted prefix plus one
-    always-accepted backbone token. The accept rule is exact token match
-    (identical to :func:`speculative_generate_step`), so the output is
-    token-for-token the same as non-speculative greedy decoding.
+    MTP head to propose ``num_draft_tokens`` draft tokens and verifies them all
+    in one backbone forward. Greedy decoding (``temp == 0``) uses exact-token
+    acceptance and is token-for-token identical to non-speculative greedy
+    decoding. Stochastic decoding (``temp > 0``) uses the standard
+    probabilistic acceptance test and samples rejected proposals from the
+    target-minus-draft residual distribution, preserving the target sampling
+    distribution.
+
+    ``sampler`` may be used to customize greedy selection. Custom sampler
+    callables are not supported with ``temp > 0`` because MTP acceptance needs
+    the sampler's complete probability distribution; stochastic MTP sampling
+    is instead controlled directly by ``temp``.
 
     The model must expose ``mtp_step(hidden, tokens, mtp_cache)``,
     ``make_mtp_cache()``, ``logits(hidden)`` and a trunk ``model`` that returns
@@ -742,7 +750,21 @@ def mtp_speculative_generate_step(
             f"(got {types})."
         )
 
-    sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
+    if temp < 0:
+        raise ValueError("temp must be non-negative")
+    if temp > 0 and sampler is not None:
+        raise ValueError(
+            "Custom sampler callables are unsupported for probabilistic MTP "
+            "acceptance; pass temp without sampler instead."
+        )
+    sampler = sampler or (
+        (lambda x: mx.random.categorical(x / temp))
+        if temp > 0
+        else (lambda x: mx.argmax(x, axis=-1))
+    )
+
+    def _probs(logprobs):
+        return mx.softmax(logprobs / temp, axis=-1)
 
     quantize_cache_fn = functools.partial(
         maybe_quantize_kv_cache,
@@ -863,23 +885,40 @@ def mtp_speculative_generate_step(
             tks = [int(t.item()) for t in toks]
             dfs = [int(d.item()) for d in drafts]
 
-            # Accept the longest matching prefix.
+            # Greedy MTP accepts exact matches. Stochastic MTP accepts draft d
+            # with min(1, p(d) / q(d)); after rejection it samples from the
+            # normalized positive residual max(p - q, 0).
             n = 0
-            while n < depth and tks[n] == dfs[n]:
-                n += 1
+            correction = None
+            if temp == 0:
+                while n < depth and tks[n] == dfs[n]:
+                    n += 1
+            else:
+                for i in range(depth):
+                    p = _probs(lps[i])
+                    q = _probs(dlps[i])
+                    d = dfs[i]
+                    accept_prob = mx.minimum(mx.array(1.0), p[d] / q[d])
+                    if (mx.random.uniform() >= accept_prob).item():
+                        residual = mx.maximum(p - q, 0)
+                        residual = residual / mx.sum(residual)
+                        correction = mx.random.categorical(mx.log(residual))
+                        break
+                    n += 1
 
             # Emit accepted drafts, then the backbone's bonus/correction token.
             stop = False
             for i in range(n):
                 ntoks += 1
-                yield dfs[i], dlps[i], True
+                yield dfs[i], lps[i], True
                 if ntoks >= max_tokens:
                     stop = True
                     break
             if stop:
                 break
             ntoks += 1
-            yield tks[n], lps[n], False
+            out_tok = toks[n] if correction is None else correction
+            yield int(out_tok.item()), lps[n], False
             if ntoks >= max_tokens:
                 break
 
@@ -893,7 +932,7 @@ def mtp_speculative_generate_step(
                 cache.trim_prompt_cache(mtp_cache, mtp_trim)
 
             # Seed the next round from the bonus token and its trunk hidden.
-            cur_tok = toks[n]
+            cur_tok = out_tok
             h_prev = hidden[:, n : n + 1, :]
     finally:
         for c in model_cache:
@@ -907,6 +946,7 @@ def stream_generate(
     max_tokens: int = 256,
     draft_model: Optional[nn.Module] = None,
     mtp: bool = False,
+    temp: float = 0.0,
     **kwargs,
 ) -> Generator[GenerationResponse, None, None]:
     """
@@ -922,6 +962,15 @@ def stream_generate(
         draft_model (Optional[nn.Module]): An optional draft model. If provided
           then speculative decoding is used. The draft model must use the same
           tokenizer as the main model. Default: ``None``.
+        mtp (bool): Use the model's native MTP head for speculative decoding.
+          Greedy decoding (``temp == 0``) uses exact-match acceptance and does
+          not change greedy output. With ``temp > 0``, MTP uses probabilistic
+          acceptance and target-minus-draft residual correction so stochastic
+          output follows the target distribution. Default: ``False``.
+        temp (float): Sampling temperature used by native MTP. Custom sampler
+          callables work for greedy MTP, but are unsupported for probabilistic
+          MTP acceptance (``temp > 0``), which requires the full sampling
+          distribution. Default: ``0.0``.
         kwargs: The remaining options get passed to :func:`generate_step`.
           See :func:`generate_step` for more details.
 
@@ -950,7 +999,9 @@ def stream_generate(
         # num_draft_tokens controls the chain depth.
         kwargs.pop("max_kv_size", None)
         kwargs.pop("prompt_progress_callback", None)
-        token_generator = mtp_speculative_generate_step(prompt, model, **kwargs)
+        token_generator = mtp_speculative_generate_step(
+            prompt, model, temp=temp, **kwargs
+        )
     elif draft_model is None:
         kwargs.pop("num_draft_tokens", None)
         token_generator = generate_step(prompt, model, **kwargs)
@@ -2358,6 +2409,7 @@ def main():
         quantized_kv_start=args.quantized_kv_start,
         draft_model=draft_model,
         num_draft_tokens=args.num_draft_tokens,
+        temp=args.temp,
     )
     if not args.verbose:
         print(response)
