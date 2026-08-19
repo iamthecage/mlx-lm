@@ -880,6 +880,50 @@ class ArraysCache(_BaseCache):
         return sum(c.nbytes for c in self.cache if c is not None)
 
 
+class MTPPromptCacheState(_BaseCache):
+    """Serializable boundary state for a reusable native-MTP cache.
+
+    For ``N`` committed tokens the backbone cache offset is ``N`` while the
+    MTP cache offset is ``N - 1``.  ``last_hidden`` is the backbone hidden for
+    token ``N``; together with the first token of a later suffix it bridges the
+    deliberately missing MTP position.
+
+    This object is intentionally not trimmable.  In particular, an LRU lookup
+    must not pretend that a hidden state for a longer prefix is valid for a
+    shorter prefix.
+    """
+
+    def __init__(self, last_hidden=None, num_tokens: int = 0):
+        self.last_hidden = last_hidden
+        self.num_tokens = int(num_tokens)
+
+    @property
+    def state(self):
+        return [] if self.last_hidden is None else [self.last_hidden]
+
+    @state.setter
+    def state(self, value):
+        self.last_hidden = value[0] if value else None
+
+    @property
+    def meta_state(self):
+        return str(self.num_tokens)
+
+    @meta_state.setter
+    def meta_state(self, value):
+        self.num_tokens = int(value or 0)
+
+    def empty(self):
+        return self.last_hidden is None
+
+    def size(self):
+        return self.num_tokens
+
+    @property
+    def nbytes(self):
+        return 0 if self.last_hidden is None else self.last_hidden.nbytes
+
+
 class ChunkedKVCache(_BaseCache):
     step = 256
 

@@ -296,6 +296,17 @@ class GenerationResponse:
     finish_reason: Optional[str] = None
 
 
+@dataclass
+class _MTPFinalizePlan:
+    backbone_trim: int
+    mtp_trim: int
+    last_hidden: Optional[mx.array]
+    target_token: Optional[mx.array]
+    mtp_hidden: Optional[mx.array]
+    mtp_token: Optional[mx.array]
+    num_tokens: int
+
+
 def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_bits):
     if kv_bits is None:
         return
@@ -721,13 +732,84 @@ def mtp_speculative_generate_step(
     y = prompt.astype(mx.uint32)
     prev_tokens = None
 
+    fresh_mtp_cache = tm.make_mtp_cache()
+    boundary = None
+    cached_tokens = 0
+    input_tokens = int(y.size)
     if prompt_cache is None:
-        model_cache = cache.make_prompt_cache(model)
-        mtp_cache = tm.make_mtp_cache()
+        model_cache = cache.make_prompt_cache(tm)
+        mtp_cache = fresh_mtp_cache
     else:
-        n_main = len(model.layers)
+        # Do all structural validation before changing caller-owned state.
+        if not isinstance(prompt_cache, list):
+            raise TypeError("prompt_cache must be a mutable list for native MTP.")
+        n_main = len(tm.layers)
+        n_mtp = len(fresh_mtp_cache)
+        if len(prompt_cache) < n_main:
+            raise ValueError(
+                "The supplied prompt_cache has fewer entries than the model backbone."
+            )
         model_cache = prompt_cache[:n_main]
-        mtp_cache = prompt_cache[n_main:] or tm.make_mtp_cache()
+        tail = prompt_cache[n_main:]
+        if tail and isinstance(tail[-1], cache.MTPPromptCacheState):
+            boundary = tail[-1]
+            mtp_cache = tail[:-1]
+        else:
+            mtp_cache = tail
+
+        model_nonempty = any(not c.empty() for c in model_cache)
+        mtp_nonempty = any(not c.empty() for c in mtp_cache)
+        if len(mtp_cache) not in (0, n_mtp):
+            raise ValueError(
+                "The supplied prompt_cache contains an incompatible number of "
+                "MTP cache entries."
+            )
+        if not mtp_cache:
+            if model_nonempty:
+                raise ValueError(
+                    "A populated backbone cache must include MTP entries and "
+                    "MTPPromptCacheState boundary metadata."
+                )
+            mtp_cache = fresh_mtp_cache
+        elif boundary is None and (model_nonempty or mtp_nonempty):
+            raise ValueError(
+                "Legacy backbone-plus-MTP caches without MTPPromptCacheState "
+                "cannot be reused safely; rebuild the prefix."
+            )
+        if boundary is None:
+            boundary = cache.MTPPromptCacheState()
+            prompt_cache[:] = model_cache + mtp_cache + [boundary]
+        elif len(prompt_cache) != n_main + n_mtp + 1:
+            raise ValueError("The supplied native-MTP prompt_cache is malformed.")
+
+        if boundary.empty() and (model_nonempty or mtp_nonempty):
+            raise ValueError(
+                "A partially populated native-MTP cache has no usable boundary "
+                "state; rebuild the prefix."
+            )
+
+        if not boundary.empty():
+            cached_tokens = boundary.num_tokens
+            if y.size == 0:
+                raise ValueError(
+                    "An exact native-MTP cache hit needs at least one suffix token "
+                    "to close the one-token MTP lag."
+                )
+            # KV-like entries expose their logical sequence length. ArraysCache
+            # is recurrent state and deliberately has no token-length metric.
+            for c in model_cache:
+                if not isinstance(c, cache.ArraysCache) and c.size() != cached_tokens:
+                    raise ValueError(
+                        "Backbone cache offsets disagree with boundary state."
+                    )
+            for c in mtp_cache:
+                if c.size() != max(cached_tokens - 1, 0):
+                    raise ValueError("MTP cache offsets disagree with boundary state.")
+
+            # Consume the saved boundary only after the update is materialized.
+            with mx.stream(generation_stream):
+                tm.mtp_step(boundary.last_hidden, y[:1].reshape(1, 1), mtp_cache)
+                mx.eval([c.state for c in mtp_cache])
 
     def _can_speculate(c):
         return c.is_trimmable() or (
@@ -838,6 +920,7 @@ def mtp_speculative_generate_step(
     depth = max(1, int(num_draft_tokens))
 
     ntoks = 0
+    finalize_plan = None
     try:
         # Bootstrap: process the last prompt token to emit the first token and
         # get the trunk hidden that seeds the first draft chain.
@@ -846,8 +929,17 @@ def mtp_speculative_generate_step(
         cur_tok = toks[0]
         cur_lp = lps[0]
         ntoks += 1
-        yield cur_tok.item(), cur_lp, False
         h_prev = hidden[:, -1:, :]
+        finalize_plan = _MTPFinalizePlan(
+            0,
+            0,
+            None,
+            cur_tok,
+            h_prev,
+            cur_tok,
+            cached_tokens + input_tokens + ntoks,
+        )
+        yield cur_tok.item(), cur_lp, False
 
         while ntoks < max_tokens:
             # Draft ``depth`` tokens by chaining the MTP head.
@@ -855,9 +947,7 @@ def mtp_speculative_generate_step(
             # Verify all drafts in one backbone forward over
             # [cur_tok, d1, ..., d_depth]. n_predict positions give the trunk
             # prediction after each of those tokens.
-            yv = mx.concatenate(
-                [cur_tok.reshape(1)] + [d.reshape(1) for d in drafts]
-            )
+            yv = mx.concatenate([cur_tok.reshape(1)] + [d.reshape(1) for d in drafts])
             toks, lps, hidden = _backbone(yv, depth + 1)
             mx.eval(toks)
             tks = [int(t.item()) for t in toks]
@@ -872,6 +962,18 @@ def mtp_speculative_generate_step(
             stop = False
             for i in range(n):
                 ntoks += 1
+                # Verification has processed the whole chain. Retain only the
+                # actually emitted prefix; the final emitted draft is the
+                # one-token boundary and therefore is not retained by MTP.
+                finalize_plan = _MTPFinalizePlan(
+                    depth - (i + 1),
+                    depth - (i + 1),
+                    hidden[:, i + 1 : i + 2, :],
+                    None,
+                    None,
+                    None,
+                    cached_tokens + input_tokens + ntoks,
+                )
                 yield dfs[i], dlps[i], True
                 if ntoks >= max_tokens:
                     stop = True
@@ -879,6 +981,15 @@ def mtp_speculative_generate_step(
             if stop:
                 break
             ntoks += 1
+            finalize_plan = _MTPFinalizePlan(
+                depth - n,
+                max(depth - n - 1, 0),
+                None,
+                toks[n],
+                None,
+                None,
+                cached_tokens + input_tokens + ntoks,
+            )
             yield tks[n], lps[n], False
             if ntoks >= max_tokens:
                 break
@@ -895,7 +1006,40 @@ def mtp_speculative_generate_step(
             # Seed the next round from the bonus token and its trunk hidden.
             cur_tok = toks[n]
             h_prev = hidden[:, n : n + 1, :]
+            finalize_plan = _MTPFinalizePlan(
+                0,
+                0,
+                None,
+                cur_tok,
+                None,
+                None,
+                cached_tokens + input_tokens + ntoks,
+            )
     finally:
+        if boundary is not None and finalize_plan is not None:
+            plan = finalize_plan
+            if plan.backbone_trim:
+                cache.trim_prompt_cache(model_cache, plan.backbone_trim)
+            if plan.mtp_trim:
+                cache.trim_prompt_cache(mtp_cache, plan.mtp_trim)
+            with mx.stream(generation_stream):
+                if plan.mtp_hidden is not None:
+                    tm.mtp_step(
+                        plan.mtp_hidden,
+                        plan.mtp_token.reshape(1, 1),
+                        mtp_cache,
+                    )
+                    quantize_cache_fn(mtp_cache)
+                last_hidden = plan.last_hidden
+                if plan.target_token is not None:
+                    last_hidden = tm.model(
+                        plan.target_token.reshape(1, 1), cache=model_cache
+                    )[:, -1:, :]
+                    quantize_cache_fn(model_cache)
+                mx.eval([c.state for c in model_cache + mtp_cache], last_hidden)
+            boundary.last_hidden = last_hidden
+            boundary.num_tokens = plan.num_tokens
+            prompt_cache[:] = model_cache + mtp_cache + [boundary]
         for c in model_cache:
             c.stop_speculation()
 
@@ -964,20 +1108,35 @@ def stream_generate(
         token_generator = speculative_generate_step(
             prompt, model, draft_model, **kwargs
         )
-    with wired_limit(model, [generation_stream]):
-        tic = time.perf_counter()
-        for n, (token, logprobs, from_draft) in enumerate(token_generator):
-            if n == 0:
-                prompt_time = time.perf_counter() - tic
-                prompt_tps = prompt.size / prompt_time
-                tic = time.perf_counter()
-            if token in tokenizer.eos_token_ids:
-                break
+    try:
+        with wired_limit(model, [generation_stream]):
+            tic = time.perf_counter()
+            for n, (token, logprobs, from_draft) in enumerate(token_generator):
+                if n == 0:
+                    prompt_time = time.perf_counter() - tic
+                    prompt_tps = prompt.size / prompt_time
+                    tic = time.perf_counter()
+                if token in tokenizer.eos_token_ids:
+                    break
 
-            detokenizer.add_token(token)
-            if (n + 1) == max_tokens:
-                break
+                detokenizer.add_token(token)
+                if (n + 1) == max_tokens:
+                    break
 
+                yield GenerationResponse(
+                    text=detokenizer.last_segment,
+                    token=token,
+                    logprobs=logprobs,
+                    from_draft=from_draft,
+                    prompt_tokens=prompt.size,
+                    prompt_tps=prompt_tps,
+                    generation_tokens=n + 1,
+                    generation_tps=(n + 1) / (time.perf_counter() - tic),
+                    peak_memory=mx.get_peak_memory() / 1e9,
+                    finish_reason=None,
+                )
+
+            detokenizer.finalize()
             yield GenerationResponse(
                 text=detokenizer.last_segment,
                 token=token,
@@ -988,22 +1147,10 @@ def stream_generate(
                 generation_tokens=n + 1,
                 generation_tps=(n + 1) / (time.perf_counter() - tic),
                 peak_memory=mx.get_peak_memory() / 1e9,
-                finish_reason=None,
+                finish_reason="stop" if token in tokenizer.eos_token_ids else "length",
             )
-
-        detokenizer.finalize()
-        yield GenerationResponse(
-            text=detokenizer.last_segment,
-            token=token,
-            logprobs=logprobs,
-            from_draft=from_draft,
-            prompt_tokens=prompt.size,
-            prompt_tps=prompt_tps,
-            generation_tokens=n + 1,
-            generation_tps=(n + 1) / (time.perf_counter() - tic),
-            peak_memory=mx.get_peak_memory() / 1e9,
-            finish_reason="stop" if token in tokenizer.eos_token_ids else "length",
-        )
+    finally:
+        token_generator.close()
 
 
 def generate(
