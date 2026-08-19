@@ -994,7 +994,6 @@ class ResponseGenerator:
                 mx.random.seed(args.seed)
 
             # Make the sampler and logit processor
-            sampler = _make_sampler(args, tokenizer)
             logits_processors = _make_logits_processors(args)
 
             # Load the KV cache
@@ -1017,7 +1016,13 @@ class ResponseGenerator:
                 tokenizer=tokenizer,
                 prompt=rest,
                 max_tokens=args.max_tokens,
-                sampler=sampler,
+                temp=args.sampling.temperature,
+                top_p=args.sampling.top_p,
+                top_k=args.sampling.top_k,
+                min_p=args.sampling.min_p,
+                xtc_probability=args.sampling.xtc_probability,
+                xtc_threshold=args.sampling.xtc_threshold,
+                xtc_special_tokens=[tokenizer.eos_token_id] + tokenizer.encode("\n"),
                 logits_processors=logits_processors,
                 prompt_cache=cache,
                 draft_model=draft_model,
@@ -1181,17 +1186,13 @@ class APIHandler(BaseHTTPRequestHandler):
         exactly what a client (e.g. an agent + its extensions) injects and
         which block dominates the context budget.
         """
-        path = getattr(
-            self.response_generator.cli_args, "dump_system_prompt", None
-        )
+        path = getattr(self.response_generator.cli_args, "dump_system_prompt", None)
         if not path or not isinstance(self.body, dict):
             return
         msgs = self.body.get("messages")
         if not isinstance(msgs, list):
             return
-        systems = [
-            m for m in msgs if isinstance(m, dict) and m.get("role") == "system"
-        ]
+        systems = [m for m in msgs if isinstance(m, dict) and m.get("role") == "system"]
         if not systems:
             return
 

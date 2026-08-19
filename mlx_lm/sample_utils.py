@@ -46,27 +46,53 @@ def make_sampler(
     if temp == 0:
         return lambda x: mx.argmax(x, axis=-1)
 
-    # Create sampler chain
-    sampling_methods = []
-    if top_p > 0 and top_p < 1.0:
-        sampling_methods.append(lambda x: apply_top_p(x, top_p))
-    if min_p != 0.0:
-        sampling_methods.append(lambda x: apply_min_p(x, min_p, min_tokens_to_keep))
-    if xtc_probability > 0.0:
-        sampling_methods.append(
-            lambda x: apply_xtc(x, xtc_probability, xtc_threshold, xtc_special_tokens)
-        )
-    if top_k > 0:
-        sampling_methods.append(lambda x: apply_top_k(x, top_k))
+    sampler_chain = make_sampler_chain(
+        top_p,
+        min_p,
+        min_tokens_to_keep,
+        top_k,
+        xtc_probability,
+        xtc_threshold,
+        xtc_special_tokens,
+    )
 
-    # Apply the sampling methods
     def sampler(logprobs):
-        for method in sampling_methods:
-            logprobs = method(logprobs)
-        # Return the sampled token
-        return categorical_sampling(logprobs, temp)
+        return categorical_sampling(sampler_chain(logprobs), temp)
 
     return sampler
+
+
+def make_sampler_chain(
+    top_p: float = 0.0,
+    min_p: float = 0.0,
+    min_tokens_to_keep: int = 1,
+    top_k: int = 0,
+    xtc_probability: float = 0.0,
+    xtc_threshold: float = 0.0,
+    xtc_special_tokens: List[int] = [],
+) -> Callable[[mx.array, Optional[mx.array]], mx.array]:
+    """Build the filtering portion of :func:`make_sampler`.
+
+    The returned callable accepts an optional ``xtc_draw`` keyword.  This lets
+    speculative decoders apply the same XTC decision to corresponding draft
+    and target distributions without changing ordinary sampling behavior.
+    """
+
+    def sampler_chain(logprobs, xtc_draw=None):
+        # Keep this order in sync with the historical make_sampler chain.
+        if 0.0 < top_p < 1.0:
+            logprobs = apply_top_p(logprobs, top_p)
+        if min_p != 0.0:
+            logprobs = apply_min_p(logprobs, min_p, min_tokens_to_keep)
+        if xtc_probability > 0.0:
+            logprobs = apply_xtc(
+                logprobs, xtc_probability, xtc_threshold, xtc_special_tokens, xtc_draw
+            )
+        if top_k > 0:
+            logprobs = apply_top_k(logprobs, top_k)
+        return logprobs
+
+    return sampler_chain
 
 
 def make_logits_processors(
@@ -237,12 +263,12 @@ def apply_top_p(logprobs: mx.array, top_p: float) -> mx.array:
     )
 
 
-@partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)
 def apply_xtc(
     logits: mx.array,
     xtc_probability: float,
     xtc_threshold: float,
     xtc_special_tokens: List[int],
+    xtc_draw: Optional[mx.array] = None,
 ) -> mx.array:
     """
     Apply XTC sampling to the logits.
@@ -267,8 +293,10 @@ def apply_xtc(
     if xtc_special_tokens:
         mask[..., xtc_special_tokens] = False
 
+    if xtc_draw is None:
+        xtc_draw = mx.random.uniform(0, 1)
     return mx.where(
-        mx.random.uniform(0, 1) > xtc_probability,
+        xtc_draw > xtc_probability,
         logits,
         mx.where(mask, -mx.inf, logits),
     )

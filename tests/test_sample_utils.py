@@ -2,7 +2,15 @@ import unittest
 
 import mlx.core as mx
 
-from mlx_lm.sample_utils import apply_min_p, apply_top_k, apply_top_p, apply_xtc
+from mlx_lm.sample_utils import (
+    apply_min_p,
+    apply_top_k,
+    apply_top_p,
+    apply_xtc,
+    categorical_sampling,
+    make_sampler,
+    make_sampler_chain,
+)
 
 
 class TestSampleUtils(unittest.TestCase):
@@ -115,6 +123,30 @@ class TestSampleUtils(unittest.TestCase):
         probs = mx.array([[0.4, 0.3, 0.15, 0.15]])
         new_probs = mx.softmax(apply_xtc(mx.log(probs), 0, 0.1, [0]), -1)
         self.assertTrue(mx.allclose(new_probs, probs))
+
+    def test_apply_xtc_injected_draw(self):
+        logits = mx.log(mx.array([[0.4, 0.3, 0.15, 0.15]]))
+        applied = apply_xtc(logits, 0.5, 0.1, [], mx.array(0.25))
+        skipped = apply_xtc(logits, 0.5, 0.1, [], mx.array(0.75))
+        self.assertTrue(
+            mx.allclose(mx.softmax(applied, -1), mx.array([[0.0, 0.0, 0.5, 0.5]]))
+        )
+        self.assertTrue(mx.allclose(skipped, logits))
+
+        # An excluded special token survives an applied XTC decision.
+        special = apply_xtc(logits, 0.5, 0.1, [0], mx.array(0.25))
+        self.assertTrue(mx.isfinite(special[0, 0]).item())
+        self.assertTrue(mx.isneginf(special[0, 1]).item())
+
+    def test_sampler_chain_matches_make_sampler(self):
+        logits = mx.log(mx.array([[0.4, 0.3, 0.2, 0.1]]))
+        chain = make_sampler_chain(0.9, 0.1, 1, 3, 0.0, 0.0, [])
+        filtered = chain(logits)
+        mx.random.seed(17)
+        expected = categorical_sampling(filtered, 0.7)
+        mx.random.seed(17)
+        actual = make_sampler(0.7, 0.9, 0.1, 1, 3)(logits)
+        self.assertEqual(actual.item(), expected.item())
 
     def test_presence_penalty(self):
         from mlx_lm.sample_utils import make_presence_penalty
