@@ -41,6 +41,37 @@ def tiny_args(**overrides):
 
 
 class TestQwen35MTP(unittest.TestCase):
+    def test_backbone_hidden_is_pre_norm_while_logits_are_normed(self):
+        mx.random.seed(0)
+        model = TextModel(tiny_args())
+        prompt = mx.random.randint(0, 64, (1, 8))
+
+        hidden = model.model(prompt)
+        normed = model.model.norm(hidden)
+
+        self.assertFalse(mx.allclose(hidden, normed, atol=1e-5).item())
+        self.assertTrue(
+            mx.allclose(
+                model(prompt),
+                model.model.embed_tokens.as_linear(normed),
+                atol=1e-5,
+            ).item()
+        )
+
+    def test_untied_logits_apply_backbone_final_norm(self):
+        mx.random.seed(0)
+        model = TextModel(tiny_args(tie_word_embeddings=False))
+        prompt = mx.random.randint(0, 64, (1, 8))
+        hidden = model.model(prompt)
+
+        self.assertTrue(
+            mx.allclose(
+                model(prompt),
+                model.lm_head(model.model.norm(hidden)),
+                atol=1e-5,
+            ).item()
+        )
+
     def test_mtp_step_shapes_and_chaining(self):
         mx.random.seed(0)
         model = TextModel(tiny_args())

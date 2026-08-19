@@ -762,12 +762,12 @@ def mtp_speculative_generate_step(
         """Run the trunk over ``y_arr``; return (tokens, logprobs, hidden).
 
         tokens/logprobs cover the last ``n_predict`` positions; hidden is the
-        full [1, S, H] trunk hidden (post-final-norm) used to seed the MTP head.
+        full [1, S, H] pre-final-norm trunk hidden used to seed the MTP head.
         """
         nonlocal prev_tokens
         with mx.stream(generation_stream):
             hidden = tm.model(y_arr[None], cache=model_cache)
-            logits = tm.logits(hidden)[:, -n_predict:, :]
+            logits = tm.logits(tm.model.norm(hidden))[:, -n_predict:, :]
             quantize_cache_fn(model_cache)
             if logits_processors:
                 out_y, out_lp = [], []
