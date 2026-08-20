@@ -113,15 +113,18 @@ def make_logits_processors(
 
         logits_processors.append(logit_bias_processor)
 
-    repetition_penalties = [
-        (make_repetition_penalty, repetition_penalty, repetition_context_size),
-        (make_presence_penalty, presence_penalty, presence_context_size),
-        (make_frequency_penalty, frequency_penalty, frequency_context_size),
-    ]
-
-    for make_penalty, penalty, context_size in repetition_penalties:
-        if penalty is not None and penalty != 0:
-            logits_processors.append(make_penalty(penalty, context_size))
+    if repetition_penalty is not None and repetition_penalty not in (0.0, 1.0):
+        logits_processors.append(
+            make_repetition_penalty(repetition_penalty, repetition_context_size)
+        )
+    if presence_penalty is not None and presence_penalty != 0.0:
+        logits_processors.append(
+            make_presence_penalty(presence_penalty, presence_context_size)
+        )
+    if frequency_penalty is not None and frequency_penalty != 0.0:
+        logits_processors.append(
+            make_frequency_penalty(frequency_penalty, frequency_context_size)
+        )
 
     return logits_processors
 
@@ -294,8 +297,8 @@ def make_repetition_penalty(penalty: float, context_size: int = 20):
         Callable[[mx.array, List[int]], mx.array]:
             The repetition penalty processor.
     """
-    if penalty < 0 or not isinstance(penalty, (int, float)):
-        raise ValueError(f"penalty must be a non-negative float, got {penalty}")
+    if not isinstance(penalty, (int, float)) or penalty <= 0:
+        raise ValueError(f"penalty must be a positive float, got {penalty}")
 
     def repetition_penalty_processor(tokens, logits):
         if len(tokens) > 0:
