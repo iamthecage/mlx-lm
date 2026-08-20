@@ -7,7 +7,6 @@ import mlx.core as mx
 from .cli_ui import ChatUI
 from .generate import stream_generate
 from .models.cache import make_prompt_cache
-from .sample_utils import make_sampler
 from .utils import load, sharded_load
 
 DEFAULT_TEMP = 0.0
@@ -144,14 +143,12 @@ def main():
                 tokenizer,
                 prompt,
                 max_tokens=args.max_tokens,
-                sampler=make_sampler(
-                    args.temp,
-                    args.top_p,
-                    xtc_threshold=args.xtc_threshold,
-                    xtc_probability=args.xtc_probability,
-                    xtc_special_tokens=(
-                        tokenizer.encode("\n") + list(tokenizer.eos_token_ids)
-                    ),
+                temp=args.temp,
+                top_p=args.top_p,
+                xtc_threshold=args.xtc_threshold,
+                xtc_probability=args.xtc_probability,
+                xtc_special_tokens=(
+                    tokenizer.encode("\n") + list(tokenizer.eos_token_ids)
                 ),
                 prompt_cache=prompt_cache,
             ):
