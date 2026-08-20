@@ -25,6 +25,7 @@ from mlx_lm.server import (
     ResponseGenerator,
     SamplingArguments,
     _make_logits_processors,
+    _prepare_cached_prompt,
     _process_control_tokens,
 )
 from mlx_lm.utils import load
@@ -378,6 +379,43 @@ class TestServerPenaltyAndCachePlumbing(unittest.TestCase):
         )
         for (_, uncached_logits), (_, cached_logits) in zip(uncached, cached):
             self.assertTrue(mx.allclose(uncached_logits, cached_logits).item())
+
+    def test_exact_cached_prompt_keeps_bootstrap_token(self):
+        """An exact cache hit must still leave one prompt token to consume."""
+
+        class TrimmableCache:
+            def __init__(self):
+                self.trimmed = 0
+
+            def is_trimmable(self):
+                return True
+
+            def trim(self, n):
+                self.trimmed += n
+                return n
+
+        prompt = [1, 2, 3, 4]
+        cached = TrimmableCache()
+        prepared, rest, count = _prepare_cached_prompt(prompt, [cached], [])
+
+        self.assertIs(prepared[0], cached)
+        self.assertEqual(rest, [4])
+        self.assertEqual(count, 3)
+        self.assertEqual(cached.trimmed, 1)
+
+    def test_exact_cached_nontrimmable_prompt_recomputes(self):
+        class NonTrimmableCache:
+            def is_trimmable(self):
+                return False
+
+        prompt = [1, 2, 3]
+        prepared, rest, count = _prepare_cached_prompt(
+            prompt, [NonTrimmableCache()], []
+        )
+
+        self.assertIsNone(prepared)
+        self.assertEqual(rest, prompt)
+        self.assertEqual(count, 0)
 
 
 class TestServer(unittest.TestCase):

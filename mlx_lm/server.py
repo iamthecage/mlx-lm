@@ -41,7 +41,9 @@ from .generate import (
 )
 from .models.cache import (
     LRUPromptCache,
+    can_trim_prompt_cache,
     make_prompt_cache,
+    trim_prompt_cache,
 )
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import _parse_size, load, sharded_load
@@ -426,6 +428,28 @@ def _make_logits_processors(args):
     )
 
 
+def _prepare_cached_prompt(prompt, prompt_cache, rest):
+    """Return a generation-safe cache and prompt remainder.
+
+    Generation consumes the final prompt token to bootstrap the first logits
+    row, so an exact cache hit (whose remainder is empty) cannot be passed
+    directly to any generation path.  Trim one cached token when possible;
+    otherwise fall back to recomputing the prompt rather than duplicating a
+    token in a non-trimmable cache.
+    """
+    if rest or not prompt or prompt_cache is None:
+        return prompt_cache, rest, len(prompt) - len(rest)
+
+    if prompt_cache and can_trim_prompt_cache(prompt_cache):
+        if trim_prompt_cache(prompt_cache, 1) == 1:
+            return prompt_cache, prompt[-1:], len(prompt) - 1
+
+    # Some recurrent caches cannot be rolled back.  Recompute the full prompt
+    # in that case; this preserves exact generation semantics and avoids an
+    # invalid empty-input model call.
+    return None, prompt, 0
+
+
 def _format_top_logprobs(logprobs, top_n, tokenizer) -> Tuple[Dict[str, Any]]:
     """Returns info dicts for the top `top_n` tokens from `logprobs`"""
     if top_n <= 0:
@@ -756,7 +780,9 @@ class ResponseGenerator:
                     cache, rest = self.prompt_cache.fetch_nearest_cache(
                         current_model_key, prompt
                     )
-                    prompt_cache_count = len(prompt) - len(rest)
+                    cache, rest, prompt_cache_count = _prepare_cached_prompt(
+                        prompt, cache, rest
+                    )
                     N = prompt_cache_count
                     while N > 0:
                         if N >= len(segments[0]):
@@ -1002,7 +1028,9 @@ class ResponseGenerator:
             cache, rest = self.prompt_cache.fetch_nearest_cache(
                 self.model_provider.model_key, prompt
             )
-            prompt_cache_count = len(prompt) - len(rest)
+            cache, rest, prompt_cache_count = _prepare_cached_prompt(
+                prompt, cache, rest
+            )
             ctx.prompt_cache_count = prompt_cache_count
             cache_key = prompt[:]
             if cache is None:

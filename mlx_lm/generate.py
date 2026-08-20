@@ -1659,7 +1659,18 @@ class GenerationBatch:
         self._current_logprobs = []
         self._next_tokens = inputs
         self._next_logprobs = []
-        self._token_context = [TokenBuffer(t) for t in tokens]
+        # Keep processor history only for sequences that actually have an
+        # active processor.  In the common no-processor path this avoids a
+        # full prompt copy per sequence while retaining positional alignment
+        # when batches are extended or filtered.
+        self._token_context = (
+            [
+                TokenBuffer(t) if processors else None
+                for t, processors in zip(tokens, self.logits_processors)
+            ]
+            if self.logits_processors
+            else [None] * len(tokens)
+        )
         self._num_tokens = [0] * len(self.uids)
         self._matcher_states = [m.make_state() for m in state_machines]
 
@@ -1716,7 +1727,11 @@ class GenerationBatch:
         if any(self.logits_processors):
             # Update the token context that will be used by the logits processors
             token_context = [
-                tc.update_and_fetch(inputs[i : i + 1])
+                (
+                    tc.update_and_fetch(inputs[i : i + 1])
+                    if self.logits_processors[i]
+                    else None
+                )
                 for i, tc in enumerate(self._token_context)
             ]
             processed_logits = []
