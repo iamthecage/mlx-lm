@@ -1025,12 +1025,20 @@ class ResponseGenerator:
 
             # Load the KV cache
             self._log_cache_stats()
-            cache, rest = self.prompt_cache.fetch_nearest_cache(
-                self.model_provider.model_key, prompt
-            )
-            cache, rest, prompt_cache_count = _prepare_cached_prompt(
-                prompt, cache, rest
-            )
+            speculative = draft_model is not None or self.cli_args.mtp_draft
+            if speculative:
+                # External-draft and native-MTP generators do not yet expose a
+                # single cache-position invariant at every termination point.
+                # Reusing or storing those caches can associate a trie key with
+                # state that is behind or ahead of the emitted token history.
+                cache, rest, prompt_cache_count = None, prompt, 0
+            else:
+                cache, rest = self.prompt_cache.fetch_nearest_cache(
+                    self.model_provider.model_key, prompt
+                )
+                cache, rest, prompt_cache_count = _prepare_cached_prompt(
+                    prompt, cache, rest
+                )
             ctx.prompt_cache_count = prompt_cache_count
             cache_key = prompt[:]
             if cache is None:
@@ -1123,9 +1131,10 @@ class ResponseGenerator:
             rqueue.put(None)
 
             # Save the KV cache again
-            self.prompt_cache.insert_cache(
-                self.model_provider.model_key, cache_key, cache
-            )
+            if not speculative:
+                self.prompt_cache.insert_cache(
+                    self.model_provider.model_key, cache_key, cache
+                )
 
         except Exception as e:
             rqueue.put(e)
