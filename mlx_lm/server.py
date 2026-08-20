@@ -1002,7 +1002,8 @@ class ResponseGenerator:
             cache, rest = self.prompt_cache.fetch_nearest_cache(
                 self.model_provider.model_key, prompt
             )
-            ctx.prompt_cache_count = len(prompt) - len(rest)
+            prompt_cache_count = len(prompt) - len(rest)
+            ctx.prompt_cache_count = prompt_cache_count
             cache_key = prompt[:]
             if cache is None:
                 cache = make_prompt_cache(self.model_provider.model)
@@ -1016,6 +1017,7 @@ class ResponseGenerator:
                 model=model,
                 tokenizer=tokenizer,
                 prompt=rest,
+                prompt_cache_tokens=prompt[:prompt_cache_count],
                 max_tokens=args.max_tokens,
                 sampler=sampler,
                 logits_processors=logits_processors,
