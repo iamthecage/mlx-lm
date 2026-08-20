@@ -350,6 +350,81 @@ class TestServerPenaltyAndCachePlumbing(unittest.TestCase):
         self.assertEqual(captured["prompt"], [3, 4])
         self.assertEqual(captured["prompt_cache_tokens"], [1, 2])
 
+    def test_speculative_single_requests_bypass_prompt_cache(self):
+        prompt = [1, 2, 3, 4]
+
+        class PromptCache:
+            def fetch_nearest_cache(self, *args, **kwargs):
+                raise AssertionError("speculative generation must not fetch cache")
+
+            def insert_cache(self, *args, **kwargs):
+                raise AssertionError("speculative generation must not store cache")
+
+        for draft_model, mtp_draft in ((object(), False), (None, True)):
+            with self.subTest(external_draft=draft_model is not None, mtp=mtp_draft):
+                captured = {}
+                provider = types.SimpleNamespace(
+                    model=object(),
+                    tokenizer=types.SimpleNamespace(
+                        has_thinking=False,
+                        has_tool_calling=False,
+                        tool_parser=lambda text, tools: {},
+                    ),
+                    draft_model=draft_model,
+                    model_key=("model", None, None),
+                    cli_args=types.SimpleNamespace(
+                        mtp_draft=mtp_draft,
+                        prefill_step_size=8,
+                        kv_bits=None,
+                        kv_group_size=64,
+                        quantized_kv_start=0,
+                    ),
+                )
+                generator = ResponseGenerator.__new__(ResponseGenerator)
+                generator.model_provider = provider
+                generator.prompt_cache = PromptCache()
+                generator._is_distributed = False
+                generator._tokenize = lambda tokenizer, request, args: (
+                    prompt,
+                    [prompt],
+                    ["assistant"],
+                    "normal",
+                )
+                generator._make_state_machine = lambda *args, **kwargs: (
+                    types.SimpleNamespace(
+                        make_state=lambda: None,
+                        match=lambda state, token: (state, None, "normal"),
+                    ),
+                    {},
+                )
+                generator._log_cache_stats = lambda: None
+
+                def fake_stream_generate(**kwargs):
+                    captured.update(kwargs)
+                    return iter(())
+
+                request = types.SimpleNamespace(request_type="text", prompt="hello")
+                rqueue = Queue()
+                with patch(
+                    "mlx_lm.server.stream_generate", fake_stream_generate
+                ), patch(
+                    "mlx_lm.server.make_prompt_cache", return_value=["fresh"]
+                ), patch(
+                    "mlx_lm.server._make_sampler", return_value=lambda logits: logits
+                ), patch("mlx_lm.server._make_logits_processors", return_value=[]):
+                    generator._serve_single(
+                        (rqueue, request, self._generation_args())
+                    )
+
+                context = rqueue.get_nowait()
+                self.assertEqual(context.prompt_cache_count, 0)
+                self.assertIsNone(rqueue.get_nowait())
+                self.assertEqual(captured["prompt"], prompt)
+                self.assertEqual(captured["prompt_cache_tokens"], [])
+                self.assertEqual(
+                    len(captured["prompt_cache"]), 2 if draft_model else 1
+                )
+
     def test_cached_and_uncached_greedy_active_penalty_match(self):
         prompt = mx.array([1, 2, 3, 4], dtype=mx.uint32)
         processors = make_logits_processors(presence_penalty=1.5)
