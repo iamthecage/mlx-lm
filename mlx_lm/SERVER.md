@@ -73,19 +73,22 @@ curl localhost:8080/v1/chat/completions \
   Defaults to `0.0` (disabled).
 
 - `repetition_penalty`: (Optional) Applies a multiplicative penalty to repeated
-  tokens. Defaults to `0.0` (disabled).
+  tokens. A factor of `1.0` is a mathematical no-op. The legacy sentinel `0.0`
+  is also accepted and disables this penalty. Defaults to `0.0` (disabled).
 
 - `repetition_context_size`: (Optional) The size of the context window for
   applying repetition penalty. Defaults to `20`.
 
 - `presence_penalty`: (Optional) Applies an additive penalty to tokens
-  that appeared before. Defaults to `0.0` (disabled).
+  that appeared before. A value of `0.0` disables this penalty. Defaults to
+  `0.0` (disabled).
 
 - `presence_context_size`: (Optional) The size of the context window for
   applying presence penalty. Defaults to `20`.
 
 - `frequency_penalty`: (Optional) Applies an additive penalty proportional to
-  how many times a token appeared previously. Defaults to `0.0` (disabled).
+  how many times a token appeared previously. A value of `0.0` disables this
+  penalty. Defaults to `0.0` (disabled).
 
 - `frequency_context_size`: (Optional) The size of the context window for
   applying frequency penalty. Defaults to `20`.
@@ -109,6 +112,10 @@ curl localhost:8080/v1/chat/completions \
 
 - `num_draft_tokens`: (Optional) The number of draft tokens the draft model
   should predict at once. Defaults to `3`.
+
+Repetition, presence, and frequency penalties are applied to vanilla,
+external-draft, and native MTP generation. Enabling a penalty does not disable
+prompt caching or speculative decoding.
 
 ### Response Fields
 
