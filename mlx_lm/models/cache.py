@@ -1645,11 +1645,31 @@ class TokenBuffer:
 
     step = 256
 
-    def __init__(self, tokens=[]):
+    def __init__(self, tokens=()):
         self._buffer = mx.array(tokens, dtype=mx.int32)
         self._size = len(tokens)
 
+    def __len__(self):
+        """Return the number of logically live tokens in the buffer."""
+        return self._size
+
+    def trim(self, n: int) -> int:
+        """Remove up to ``n`` tokens from the end of the logical buffer.
+
+        Trimming only adjusts the logical size.  The allocated backing buffer
+        is retained so that a subsequent append can overwrite the discarded
+        region without an allocation or copy.
+        """
+        if n < 0:
+            raise ValueError("Cannot trim a negative number of tokens")
+
+        removed = min(self._size, n)
+        self._size -= removed
+        return removed
+
     def update_and_fetch(self, tokens):
+        if not isinstance(tokens, mx.array):
+            tokens = mx.array(tokens, dtype=mx.int32)
         start = self._size
         end = start + len(tokens)
 
