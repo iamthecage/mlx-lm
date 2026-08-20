@@ -1,5 +1,6 @@
 # Copyright © 2026 Apple Inc.
 
+import itertools
 import unittest
 
 import mlx.core as mx
@@ -264,6 +265,54 @@ class TestMTPGeneration(unittest.TestCase):
         generator.close()
         self.assertEqual(model_cache.trim_calls, [2])
         self.assertEqual(mtp_cache.trim_calls, [1])
+
+    def test_generator_close_mid_accepted_chain_trims_unemitted_drafts(self):
+        model_cache = _TinyCache()
+        mtp_cache = _TinyCache()
+        generator = mtp_speculative_generate_step(
+            mx.array([1, 2, 3], dtype=mx.uint32),
+            _TinyMTPModel(),
+            prompt_cache=[model_cache, mtp_cache],
+            max_tokens=99,
+            num_draft_tokens=2,
+            logits_processors=[lambda _, logits: logits],
+        )
+
+        next(generator)  # bootstrap
+        next(generator)  # first of two accepted drafts
+        generator.close()
+
+        # The second accepted-by-target draft was never emitted.  The model
+        # cache must therefore retain only the prompt and the two yielded
+        # tokens, while the MTP cache keeps the seed plus first accepted pair.
+        self.assertEqual(model_cache.offset, 5)
+        self.assertEqual(model_cache.trim_calls, [1])
+        self.assertEqual(mtp_cache.trim_calls, [])
+
+    def test_max_tokens_mid_accepted_chain_keeps_cache_key_aligned(self):
+        prompt = mx.array([1, 2, 3], dtype=mx.uint32)
+        processor_options = (None, [lambda _, logits: logits])
+        for max_tokens, processors in itertools.product(
+            (2, 5), processor_options
+        ):
+            with self.subTest(
+                max_tokens=max_tokens, processors_active=processors is not None
+            ):
+                model_cache = _TinyCache()
+                mtp_cache = _TinyCache()
+                output = list(
+                    mtp_speculative_generate_step(
+                        prompt,
+                        _TinyMTPModel(),
+                        prompt_cache=[model_cache, mtp_cache],
+                        max_tokens=max_tokens,
+                        num_draft_tokens=2,
+                        logits_processors=processors,
+                    )
+                )
+
+                self.assertEqual(len(output), max_tokens)
+                self.assertEqual(model_cache.offset, len(prompt) + len(output))
 
     def test_no_processor_path_matches_vanilla(self):
         prompt = mx.array([1, 2, 3], dtype=mx.uint32)
