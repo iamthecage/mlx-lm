@@ -711,6 +711,7 @@ def mtp_speculative_generate_step(
     sampler: Optional[Callable[[mx.array], mx.array]] = None,
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
     prompt_cache: Optional[Any] = None,
+    prompt_cache_tokens: Optional[mx.array] = None,
     prefill_step_size: int = 512,
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
@@ -732,6 +733,10 @@ def mtp_speculative_generate_step(
 
     Yields:
         Tuple[mx.array, mx.array, bool]: (token, log-probabilities, from_draft).
+
+    ``prompt_cache_tokens`` contains token ids already represented by
+    ``prompt_cache`` and omitted from ``prompt``.  When logits processors are
+    enabled, these ids are prepended to the processor history.
     """
     # The MTP head + helpers live on the text model, which may be nested under a
     # VLM wrapper (``model.language_model``).
@@ -742,8 +747,20 @@ def mtp_speculative_generate_step(
             "(qwen3_5 '-mtp' checkpoint)."
         )
 
-    y = prompt.astype(mx.uint32)
-    prev_tokens = None
+    original_prompt = prompt
+    y = original_prompt.astype(mx.uint32)
+    token_buffer = None
+    if logits_processors:
+        # Keep the logical processor history independent of the prefill slices
+        # below.  As in ``generate_step``, the final prompt token is appended by
+        # the bootstrap backbone call, so initialize with the preceding prompt
+        # and any cached prefix.
+        prompt_history = original_prompt[:-1]
+        if prompt_cache_tokens is not None:
+            prompt_history = mx.concatenate(
+                [mx.array(prompt_cache_tokens), prompt_history]
+            )
+        token_buffer = TokenBuffer(prompt_history)
 
     if prompt_cache is None:
         model_cache = cache.make_prompt_cache(model)
@@ -776,7 +793,16 @@ def mtp_speculative_generate_step(
     )
 
     def _process_and_sample(tokens, logits):
+        """Apply processors and sample one or more logits rows.
+
+        Processor callbacks always receive a one-dimensional token history and
+        a two-dimensional ``[1, vocab]`` logits array.  The no-processor path
+        intentionally keeps the original vectorized shape so MTP verification
+        retains its fast target-model sampling path.
+        """
         if logits_processors:
+            if logits.ndim == 1:
+                logits = logits[None, :]
             for processor in logits_processors:
                 logits = processor(tokens, logits)
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
@@ -788,24 +814,23 @@ def mtp_speculative_generate_step(
         tokens/logprobs cover the last ``n_predict`` positions; hidden is the
         full [1, S, H] pre-final-norm trunk hidden used to seed the MTP head.
         """
-        nonlocal prev_tokens
         with mx.stream(generation_stream):
             hidden = tm.model(y_arr[None], cache=model_cache)
             logits = tm.logits(tm.model.norm(hidden))[:, -n_predict:, :]
             quantize_cache_fn(model_cache)
             if logits_processors:
                 out_y, out_lp = [], []
-                yy = y_arr[: -(n_predict - 1)] if n_predict > 1 else y_arr
                 for i in range(n_predict):
-                    prev_tokens = (
-                        mx.concatenate([prev_tokens, yy])
-                        if prev_tokens is not None
-                        else yy
-                    )
-                    ty, lp = _process_and_sample(prev_tokens, logits[:, i, :])
-                    out_y.append(ty)
+                    # Processor history follows target-model sampled tokens,
+                    # not speculative draft inputs.  Position zero consumes
+                    # ``cur_tok``; each later position consumes the prior
+                    # target sample.  The caller rolls this temporary suffix
+                    # back after accepting the draft prefix.
+                    history_token = y_arr[:1] if i == 0 else out_y[-1]
+                    tokens = token_buffer.update_and_fetch(history_token)
+                    ty, lp = _process_and_sample(tokens, logits[:, i, :])
+                    out_y.append(ty.reshape(-1))
                     out_lp.append(lp)
-                    yy = ty
                 return (
                     mx.concatenate(out_y, axis=0),
                     mx.concatenate(out_lp, axis=0),
@@ -822,22 +847,41 @@ def mtp_speculative_generate_step(
         ``mtp_cache`` (pair 0 is the committed seed; pair i>0 is based on draft
         ``i`` and is rolled back if that draft is rejected).
         """
-        drafts, dlps = [], []
+        drafts = []
         h = h_seed
         t = tok_seed.reshape(1, 1)
+        history_start = len(token_buffer) if token_buffer is not None else None
         with mx.stream(generation_stream):
-            for _ in range(depth):
-                d_logits, post = tm.mtp_step(h, t, mtp_cache)
-                quantize_cache_fn(mtp_cache)
-                d_tok, d_lp = _process_and_sample(
-                    prev_tokens, d_logits[:, -1, :].squeeze(0)
-                )
-                mx.async_eval(d_tok)
-                drafts.append(d_tok)
-                dlps.append(d_lp)
-                h = post[:, -1:, :]
-                t = d_tok.reshape(1, 1)
-        return drafts, dlps
+            try:
+                for _ in range(depth):
+                    d_logits, post = tm.mtp_step(h, t, mtp_cache)
+                    quantize_cache_fn(mtp_cache)
+                    if round_state is not None and not round_state["target_started"]:
+                        # Count the pair immediately so an exception from a
+                        # draft processor can still roll back the MTP cache.
+                        round_state["draft_count"] += 1
+                    if token_buffer is not None:
+                        # Draft history is temporary: include the current
+                        # seed before draft one, then each prior sampled draft.
+                        draft_tokens = token_buffer.update_and_fetch(t.reshape(-1))
+                    else:
+                        draft_tokens = None
+                    draft_logits = d_logits[:, -1, :]
+                    if not logits_processors:
+                        # Retain the historical one-dimensional draft sampler
+                        # input on the no-processor fast path.  Processors must
+                        # see the unsqueezed [1, vocab] row above.
+                        draft_logits = draft_logits.squeeze(0)
+                    d_tok, _ = _process_and_sample(draft_tokens, draft_logits)
+                    d_tok = d_tok.reshape(-1)
+                    mx.async_eval(d_tok)
+                    drafts.append(d_tok)
+                    h = post[:, -1:, :]
+                    t = d_tok.reshape(1, 1)
+            finally:
+                if token_buffer is not None:
+                    token_buffer.trim(len(token_buffer) - history_start)
+        return drafts
 
     # Prefill the trunk, leaving one token for the bootstrap step. Prime the MTP
     # head's own cache with (hidden_i, token_{i+1}) pairs so it has prompt
@@ -861,6 +905,54 @@ def mtp_speculative_generate_step(
 
     depth = max(1, int(num_draft_tokens))
 
+    # A round owns one logical-history rollback.  Keeping this bookkeeping in
+    # one place makes generator interruption (close/exception during a yield)
+    # idempotent: cache and TokenBuffer trims are either all applied once or
+    # not applied at all.
+    round_state = None
+
+    def _rollback_round():
+        nonlocal round_state
+        if round_state is None:
+            return
+
+        state = round_state
+        round_state = None
+        depth_used = state["depth"]
+        accepted = state["accepted"]
+        target_started = state["target_started"]
+
+        if target_started:
+            # The backbone consumed [cur_tok, draft_1, ..., draft_D].  Keep
+            # cur_tok plus the accepted prefix and discard exactly D-n target
+            # positions.  The MTP cache retains its seed pair and accepted
+            # draft pairs, hence max(D-n-1, 0).
+            model_trim = depth_used - accepted
+            mtp_trim = max(model_trim - 1, 0)
+            try:
+                cache.trim_prompt_cache(model_cache, model_trim)
+                if mtp_trim:
+                    cache.trim_prompt_cache(mtp_cache, mtp_trim)
+            finally:
+                if token_buffer is not None:
+                    if state["target_complete"]:
+                        history_trim = model_trim
+                    else:
+                        # If the target callback raised part way through a
+                        # verification, remove only the history suffix actually
+                        # appended by that callback.
+                        history_trim = max(
+                            len(token_buffer) - state["history_start"], 0
+                        )
+                    token_buffer.trim(history_trim)
+        else:
+            # An interruption during draft chaining cannot have changed the
+            # trunk cache.  Keep the MTP seed pair, mirroring the normal
+            # all-rejected formula for the drafts produced so far.
+            mtp_trim = max(state["draft_count"] - 1, 0)
+            if mtp_trim:
+                cache.trim_prompt_cache(mtp_cache, mtp_trim)
+
     ntoks = 0
     try:
         # Bootstrap: process the last prompt token to emit the first token and
@@ -874,14 +966,24 @@ def mtp_speculative_generate_step(
         h_prev = hidden[:, -1:, :]
 
         while ntoks < max_tokens:
+            round_state = {
+                "depth": depth,
+                "accepted": 0,
+                "draft_count": 0,
+                "target_started": False,
+                "target_complete": False,
+                "history_start": len(token_buffer) if token_buffer is not None else 0,
+            }
             # Draft ``depth`` tokens by chaining the MTP head.
-            drafts, dlps = _mtp_chain(h_prev, cur_tok, depth)
+            drafts = _mtp_chain(h_prev, cur_tok, depth)
+            round_state["draft_count"] = len(drafts)
             # Verify all drafts in one backbone forward over
             # [cur_tok, d1, ..., d_depth]. n_predict positions give the trunk
             # prediction after each of those tokens.
             yv = mx.concatenate(
                 [cur_tok.reshape(1)] + [d.reshape(1) for d in drafts]
             )
+            round_state["target_started"] = True
             toks, lps, hidden = _backbone(yv, depth + 1)
             mx.eval(toks)
             tks = [int(t.item()) for t in toks]
@@ -891,12 +993,16 @@ def mtp_speculative_generate_step(
             n = 0
             while n < depth and tks[n] == dfs[n]:
                 n += 1
+            round_state["accepted"] = n
+            round_state["target_complete"] = True
 
             # Emit accepted drafts, then the backbone's bonus/correction token.
             stop = False
             for i in range(n):
                 ntoks += 1
-                yield dfs[i], dlps[i], True
+                # Verification logits are authoritative: MTP logprobs are
+                # deliberately not retained or exposed to callers.
+                yield dfs[i], lps[i], True
                 if ntoks >= max_tokens:
                     stop = True
                     break
@@ -907,21 +1013,17 @@ def mtp_speculative_generate_step(
             if ntoks >= max_tokens:
                 break
 
-            # Roll back rejected drafts: the trunk processed (depth + 1) tokens;
-            # keep cur_tok + the n accepted drafts, trim (depth - n). The MTP
-            # cache appended (depth) pairs; keep pair 0 (committed seed) + the n
-            # accepted-draft pairs, trim (depth - n - 1).
-            cache.trim_prompt_cache(model_cache, depth - n)
-            mtp_trim = max(depth - n - 1, 0)
-            if mtp_trim:
-                cache.trim_prompt_cache(mtp_cache, mtp_trim)
+            _rollback_round()
 
             # Seed the next round from the bonus token and its trunk hidden.
             cur_tok = toks[n]
             h_prev = hidden[:, n : n + 1, :]
     finally:
-        for c in model_cache:
-            c.stop_speculation()
+        try:
+            _rollback_round()
+        finally:
+            for c in model_cache:
+                c.stop_speculation()
 
 
 def stream_generate(
