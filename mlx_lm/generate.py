@@ -923,11 +923,17 @@ def mtp_speculative_generate_step(
         target_started = state["target_started"]
 
         if target_started:
-            # The backbone consumed [cur_tok, draft_1, ..., draft_D].  Keep
-            # cur_tok plus the accepted prefix and discard exactly D-n target
-            # positions.  The MTP cache retains its seed pair and accepted
-            # draft pairs, hence max(D-n-1, 0).
-            model_trim = depth_used - accepted
+            # The backbone consumed [cur_tok, draft_1, ..., draft_D].  A
+            # consumer may close the generator between accepted-token yields,
+            # so only drafts actually emitted to the consumer are committed.
+            # Once the correction/bonus token has been emitted, the complete
+            # target-accepted prefix is committed as well.
+            committed_accepted = (
+                accepted
+                if state["correction_emitted"]
+                else state["emitted_accepted"]
+            )
+            model_trim = depth_used - committed_accepted
             mtp_trim = max(model_trim - 1, 0)
             try:
                 cache.trim_prompt_cache(model_cache, model_trim)
@@ -969,6 +975,8 @@ def mtp_speculative_generate_step(
             round_state = {
                 "depth": depth,
                 "accepted": 0,
+                "emitted_accepted": 0,
+                "correction_emitted": False,
                 "draft_count": 0,
                 "target_started": False,
                 "target_complete": False,
@@ -1000,6 +1008,7 @@ def mtp_speculative_generate_step(
             stop = False
             for i in range(n):
                 ntoks += 1
+                round_state["emitted_accepted"] += 1
                 # Verification logits are authoritative: MTP logprobs are
                 # deliberately not retained or exposed to callers.
                 yield dfs[i], lps[i], True
@@ -1009,6 +1018,7 @@ def mtp_speculative_generate_step(
             if stop:
                 break
             ntoks += 1
+            round_state["correction_emitted"] = True
             yield tks[n], lps[n], False
             if ntoks >= max_tokens:
                 break
