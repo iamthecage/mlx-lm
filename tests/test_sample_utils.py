@@ -174,6 +174,23 @@ class TestSampleUtils(unittest.TestCase):
         self.assertAlmostEqual(logits[0, 2].item(), 0.0, places=4)
         self.assertAlmostEqual(logits[0, 3].item(), -0.5, places=4)
 
+    def test_make_logits_processors_penalty_activation(self):
+        from mlx_lm.sample_utils import make_logits_processors
+
+        self.assertEqual(make_logits_processors(repetition_penalty=0.0), [])
+        self.assertEqual(make_logits_processors(repetition_penalty=1.0), [])
+        self.assertEqual(len(make_logits_processors(repetition_penalty=1.1)), 1)
+
+        self.assertEqual(make_logits_processors(presence_penalty=0.0), [])
+        self.assertEqual(len(make_logits_processors(presence_penalty=1.5)), 1)
+        self.assertEqual(make_logits_processors(frequency_penalty=0.0), [])
+
+    def test_make_repetition_penalty_rejects_zero(self):
+        from mlx_lm.sample_utils import make_repetition_penalty
+
+        with self.assertRaises(ValueError):
+            make_repetition_penalty(0.0)
+
 
 if __name__ == "__main__":
     unittest.main()
