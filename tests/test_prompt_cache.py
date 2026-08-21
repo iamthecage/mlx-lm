@@ -16,6 +16,7 @@ from mlx_lm.models.cache import (
     CacheList,
     ChunkedKVCache,
     KVCache,
+    MTPPromptCacheState,
     QuantizedKVCache,
     RotatingKVCache,
     load_prompt_cache,
@@ -60,6 +61,24 @@ class TestPromptCache(unittest.TestCase):
         save_prompt_cache(cache_file, cache, metadata)
         _, loaded_metadata = load_prompt_cache(cache_file, return_metadata=True)
         self.assertEqual(metadata, loaded_metadata)
+
+    def test_mtp_boundary_state_save_load_and_copy(self):
+        hidden = mx.arange(12).reshape(1, 1, 12)
+        state = MTPPromptCacheState(hidden, 17)
+        cache_file = os.path.join(self.test_dir, "mtp_prompt_cache.safetensors")
+        save_prompt_cache(cache_file, [state])
+
+        (loaded,) = load_prompt_cache(cache_file)
+        self.assertIsInstance(loaded, MTPPromptCacheState)
+        self.assertEqual(loaded.num_tokens, 17)
+        self.assertEqual(loaded.size(), 17)
+        self.assertEqual(loaded.nbytes, hidden.nbytes)
+        self.assertFalse(loaded.is_trimmable())
+        self.assertTrue(mx.array_equal(loaded.last_hidden, hidden))
+
+        cloned = copy.deepcopy(loaded)
+        cloned.num_tokens = 18
+        self.assertEqual(loaded.num_tokens, 17)
 
     def test_save_load_rotating_cache(self):
         cache_file = os.path.join(self.test_dir, "prompt_cache.safetensors")
