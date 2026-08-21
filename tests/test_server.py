@@ -6,16 +6,25 @@ import json
 import threading
 import types
 import unittest
+from queue import Queue
+from unittest.mock import patch
 
 import mlx.core as mx
 import requests
 
+from mlx_lm.generate import generate_step
 from mlx_lm.models.cache import KVCache
+from mlx_lm.sample_utils import make_logits_processors
 from mlx_lm.server import (
     APIHandler,
+    GenerationArguments,
+    LogitsProcessorArguments,
     LRUPromptCache,
+    ModelDescription,
     Response,
     ResponseGenerator,
+    SamplingArguments,
+    _make_logits_processors,
     _process_control_tokens,
 )
 from mlx_lm.utils import load
@@ -155,6 +164,220 @@ class TestProcessControlTokens(unittest.TestCase):
             [t.state for t in out],
             ["tool", "tool", "tool", "normal", "normal"],
         )
+
+
+class _PenaltyHistoryModel:
+    """Small deterministic model for server cache/penalty parity tests."""
+
+    vocab_size = 32
+    layers = [object()]
+
+    def __call__(self, tokens, cache=None, input_embeddings=None):
+        del cache, input_embeddings
+        rows = []
+        for token in tokens[0].tolist():
+            next_token = (token + 1) % self.vocab_size
+            rows.append(
+                mx.where(
+                    mx.arange(self.vocab_size) == next_token,
+                    mx.array(10.0),
+                    mx.array(0.0),
+                )
+            )
+        return mx.stack(rows, axis=0)[None]
+
+
+class TestServerPenaltyAndCachePlumbing(unittest.TestCase):
+    @staticmethod
+    def _generation_args(repetition_penalty=0.0, presence_penalty=0.0):
+        return GenerationArguments(
+            model=ModelDescription("model", "draft", None),
+            sampling=SamplingArguments(0.0, 1.0, 0, 0.0, 0.0, 0.0),
+            logits=LogitsProcessorArguments(
+                logit_bias=None,
+                repetition_penalty=repetition_penalty,
+                repetition_context_size=20,
+                presence_penalty=presence_penalty,
+                presence_context_size=20,
+                frequency_penalty=0.0,
+                frequency_context_size=20,
+            ),
+            stop_words=[],
+            max_tokens=4,
+            num_draft_tokens=2,
+            logprobs=False,
+            top_logprobs=-1,
+            seed=None,
+            chat_template_kwargs=None,
+        )
+
+    def test_repetition_factor_one_is_preserved_by_request_parser(self):
+        """The API parser must not rewrite an explicitly requested 1.0."""
+        body = {
+            "prompt": "hello",
+            "model": "default_model",
+            "max_tokens": 1,
+            "temperature": 0.3,
+            "top_p": 0.8,
+            "top_k": 4,
+            "min_p": 0.2,
+            "repetition_penalty": 1.0,
+            "presence_penalty": 1.5,
+        }
+        raw_body = json.dumps(body).encode()
+        captured = {}
+
+        cli_args = types.SimpleNamespace(
+            num_draft_tokens=3,
+            temp=0.0,
+            top_p=1.0,
+            top_k=0,
+            min_p=0.0,
+            max_tokens=512,
+            chat_template_args={},
+        )
+
+        def generate(request, args, progress_callback=None):
+            del request, progress_callback
+            captured["args"] = args
+            raise RuntimeError("stop after argument construction")
+
+        handler = object.__new__(APIHandler)
+        handler.response_generator = types.SimpleNamespace(
+            cli_args=cli_args, generate=generate
+        )
+        handler.path = "/v1/completions"
+        handler.headers = {"Content-Length": str(len(raw_body))}
+        handler.rfile = io.BytesIO(raw_body)
+        handler.wfile = io.BytesIO()
+        handler._dump_system_prompt = lambda: None
+        handler._set_completion_headers = lambda status: None
+        handler.end_headers = lambda: None
+        handler.handle_text_completions = lambda: types.SimpleNamespace(
+            request_type="text", prompt=body["prompt"], messages=[], tools=None
+        )
+
+        handler.do_POST()
+
+        args = captured["args"]
+        self.assertEqual(handler.repetition_penalty, 1.0)
+        self.assertEqual(args.sampling.temperature, 0.3)
+        self.assertEqual(args.sampling.top_p, 0.8)
+        self.assertEqual(args.sampling.top_k, 4)
+        self.assertEqual(args.sampling.min_p, 0.2)
+        self.assertEqual(args.logits.repetition_penalty, 1.0)
+        self.assertEqual(args.logits.presence_penalty, 1.5)
+
+    def test_one_repetition_factor_has_no_processor(self):
+        args = self._generation_args(repetition_penalty=1.0)
+        self.assertEqual(_make_logits_processors(args), [])
+
+    def test_one_repetition_factor_plus_presence_has_only_presence(self):
+        args = self._generation_args(repetition_penalty=1.0, presence_penalty=1.5)
+        processors = _make_logits_processors(args)
+        self.assertEqual(len(processors), 1)
+
+        tokens = mx.array([2, 2, 3])
+        logits = mx.zeros((1, _PenaltyHistoryModel.vocab_size))
+        result = processors[0](tokens, logits)
+        self.assertEqual(result[0, 2].item(), -1.5)
+        self.assertEqual(result[0, 3].item(), -1.5)
+
+    def test_cached_single_request_passes_prefix_to_generation(self):
+        prompt = [1, 2, 3, 4]
+        captured = {}
+
+        class PromptCache:
+            def fetch_nearest_cache(self, model_key, tokens):
+                self.model_key = model_key
+                self.tokens = tokens
+                return ["cached"], tokens[2:]
+
+            def insert_cache(self, *args, **kwargs):
+                pass
+
+        provider = types.SimpleNamespace(
+            model=object(),
+            tokenizer=types.SimpleNamespace(
+                has_thinking=False,
+                has_tool_calling=False,
+                tool_parser=lambda text, tools: {},
+            ),
+            draft_model=None,
+            model_key=("model", None, None),
+            cli_args=types.SimpleNamespace(
+                mtp_draft=False,
+                prefill_step_size=8,
+                kv_bits=None,
+                kv_group_size=64,
+                quantized_kv_start=0,
+            ),
+        )
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        generator.model_provider = provider
+        generator.prompt_cache = PromptCache()
+        generator._is_distributed = False
+        generator._tokenize = lambda tokenizer, request, args: (
+            prompt,
+            [prompt],
+            ["assistant"],
+            "normal",
+        )
+        generator._make_state_machine = lambda *args, **kwargs: (
+            types.SimpleNamespace(
+                make_state=lambda: None,
+                match=lambda state, token: (state, None, "normal"),
+            ),
+            {},
+        )
+        generator._log_cache_stats = lambda: None
+
+        def fake_stream_generate(**kwargs):
+            captured.update(kwargs)
+            return iter(())
+
+        request = types.SimpleNamespace(request_type="text", prompt="hello")
+        rqueue = Queue()
+        with patch("mlx_lm.server.stream_generate", fake_stream_generate), patch(
+            "mlx_lm.server._make_sampler", return_value=lambda logits: logits
+        ), patch("mlx_lm.server._make_logits_processors", return_value=[]):
+            generator._serve_single((rqueue, request, self._generation_args()))
+
+        context = rqueue.get_nowait()
+        self.assertEqual(context.prompt_cache_count, 2)
+        self.assertIsNone(rqueue.get_nowait())
+        self.assertEqual(captured["prompt"], [3, 4])
+        self.assertEqual(captured["prompt_cache_tokens"], [1, 2])
+
+    def test_cached_and_uncached_greedy_active_penalty_match(self):
+        prompt = mx.array([1, 2, 3, 4], dtype=mx.uint32)
+        processors = make_logits_processors(presence_penalty=1.5)
+
+        uncached = list(
+            generate_step(
+                prompt,
+                _PenaltyHistoryModel(),
+                max_tokens=4,
+                prompt_cache=[],
+                logits_processors=processors,
+            )
+        )
+        cached = list(
+            generate_step(
+                prompt[2:],
+                _PenaltyHistoryModel(),
+                max_tokens=4,
+                prompt_cache=[],
+                prompt_cache_tokens=prompt[:2],
+                logits_processors=make_logits_processors(presence_penalty=1.5),
+            )
+        )
+
+        self.assertEqual(
+            [token for token, _ in uncached], [token for token, _ in cached]
+        )
+        for (_, uncached_logits), (_, cached_logits) in zip(uncached, cached):
+            self.assertTrue(mx.allclose(uncached_logits, cached_logits).item())
 
 
 class TestServer(unittest.TestCase):
