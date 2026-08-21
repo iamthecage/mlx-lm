@@ -13,11 +13,183 @@ from mlx_lm.generate import (
     batch_generate,
     generate,
     generate_step,
+    speculative_generate_step,
     stream_generate,
 )
 from mlx_lm.models.cache import KVCache, RotatingKVCache
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.utils import load
+
+
+class _NoOpCache:
+    """Small trimmable cache used by processor-history unit tests."""
+
+    def __init__(self):
+        self.offset = 0
+
+    @property
+    def state(self):
+        return mx.array([self.offset], dtype=mx.int32)
+
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        removed = min(self.offset, n)
+        self.offset -= removed
+        return removed
+
+    def start_speculation(self):
+        pass
+
+    def stop_speculation(self):
+        pass
+
+
+class _HistoryModel:
+    """Deterministic model with a tiny cache surface for focused tests."""
+
+    layers = [object()]
+    vocab_size = 128
+
+    def __init__(self, offset=0):
+        self.offset = offset
+
+    def make_cache(self):
+        return [_NoOpCache()]
+
+    def __call__(self, tokens, cache=None, input_embeddings=None):
+        del input_embeddings
+        rows = []
+        for token in tokens[0].tolist():
+            next_token = (token + 1 + self.offset) % self.vocab_size
+            rows.append(
+                mx.where(
+                    mx.arange(self.vocab_size) == next_token,
+                    mx.array(10.0),
+                    mx.array(0.0),
+                )
+            )
+        return mx.stack(rows, axis=0)[None]
+
+
+class TestProcessorHistory(unittest.TestCase):
+
+    def test_vanilla_processor_sees_prefilled_prompt(self):
+        prompt = mx.array([1, 2, 3, 4], dtype=mx.uint32)
+        seen = []
+
+        def processor(tokens, logits):
+            seen.append(tokens.tolist())
+            self.assertEqual(logits.shape, (1, _HistoryModel.vocab_size))
+            return logits
+
+        list(
+            generate_step(
+                prompt,
+                _HistoryModel(),
+                max_tokens=1,
+                prefill_step_size=2,
+                logits_processors=[processor],
+            )
+        )
+
+        self.assertEqual(seen[0], prompt.tolist())
+
+    def test_cached_prompt_history_and_first_result_match_uncached(self):
+        prompt = mx.array([1, 2, 3, 4], dtype=mx.uint32)
+
+        def processor(_, logits):
+            return logits
+
+        uncached = list(
+            generate_step(
+                prompt,
+                _HistoryModel(),
+                max_tokens=1,
+                logits_processors=[processor],
+            )
+        )
+        seen = []
+
+        def cached_processor(tokens, logits):
+            seen.append(tokens.tolist())
+            return logits
+
+        cached = list(
+            generate_step(
+                prompt[2:],
+                _HistoryModel(),
+                max_tokens=1,
+                prompt_cache=[],
+                prompt_cache_tokens=prompt[:2],
+                logits_processors=[cached_processor],
+            )
+        )
+
+        self.assertEqual(uncached[0][0], cached[0][0])
+        self.assertTrue(mx.allclose(uncached[0][1], cached[0][1]))
+        self.assertEqual(seen[0], prompt.tolist())
+
+    def test_speculative_penalties_match_vanilla(self):
+        prompt = mx.array([1, 2, 3, 4], dtype=mx.uint32)
+        for processors in (
+            make_logits_processors(presence_penalty=2.0),
+            make_logits_processors(repetition_penalty=1.5),
+        ):
+            with self.subTest(processors=processors):
+                vanilla = [
+                    token
+                    for token, _ in generate_step(
+                        prompt,
+                        _HistoryModel(),
+                        max_tokens=6,
+                        logits_processors=processors,
+                    )
+                ]
+                speculative = [
+                    token
+                    for token, _, _ in speculative_generate_step(
+                        prompt,
+                        _HistoryModel(),
+                        _HistoryModel(offset=40),
+                        num_draft_tokens=2,
+                        max_tokens=6,
+                        logits_processors=processors,
+                    )
+                ]
+                self.assertEqual(vanilla, speculative)
+
+    def test_rejected_draft_tokens_do_not_reenter_target_history(self):
+        prompt = mx.array([1, 2, 3, 4], dtype=mx.uint32)
+        seen = []
+
+        def processor(tokens, logits):
+            seen.append(tokens.tolist())
+            return logits
+
+        list(
+            speculative_generate_step(
+                prompt,
+                _HistoryModel(),
+                _HistoryModel(offset=40),
+                num_draft_tokens=2,
+                max_tokens=4,
+                logits_processors=[processor],
+            )
+        )
+        # The first draft model proposes 45 and 86 for this prompt.  The first
+        # target verification is the three calls after the two draft calls;
+        # rejected draft inputs are temporary and must not occur in that
+        # target history (or in subsequent target verifications).
+        self.assertGreaterEqual(len(seen), 5)
+        target_verification = seen[2:5]
+        self.assertTrue(
+            all(
+                45 not in history and 86 not in history
+                for history in target_verification
+            )
+        )
 
 
 class TestGenerate(unittest.TestCase):
